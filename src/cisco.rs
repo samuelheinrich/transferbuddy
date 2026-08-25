@@ -118,10 +118,308 @@ pub fn commands_for_file(cfg: &Config, ip: &IpAddr, rel_path: &str) -> Vec<(Prot
     out
 }
 
+/// Free and total bytes of a device filesystem, from the footer `dir` prints:
+/// `1956839424 bytes total (234979328 bytes free)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashUsage {
+    pub total: u64,
+    pub free: u64,
+}
+
+impl FlashUsage {
+    pub fn used(&self) -> u64 {
+        self.total.saturating_sub(self.free)
+    }
+    /// 0.0 – 1.0; 0 when the device reported no size at all.
+    pub fn used_fraction(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.used() as f64 / self.total as f64
+        }
+    }
+    /// Does an image of `size` bytes still fit, with a little headroom?
+    pub fn fits(&self, size: u64) -> bool {
+        self.free > size
+    }
+}
+
+/// All plain decimal numbers in a line, in order.
+fn numbers_in(line: &str) -> Vec<u64> {
+    line.split(|c: char| !c.is_ascii_digit())
+        .filter(|t| !t.is_empty())
+        .filter_map(|t| t.parse().ok())
+        .collect()
+}
+
+/// Pull the totals out of a `dir` listing. The footer is the last line that
+/// mentions both totals, so trailing prompt lines do not matter.
+pub fn parse_dir_totals(output: &str) -> Option<FlashUsage> {
+    output
+        .lines()
+        .rev()
+        .find(|l| l.contains("bytes total") && l.contains("bytes free"))
+        .and_then(|line| match numbers_in(line)[..] {
+            [total, free, ..] => Some(FlashUsage { total, free }),
+            _ => None,
+        })
+}
+
+/// One member of a stack, from the `Switch Ports Model SW Version` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackMember {
+    pub number: u16,
+    pub model: String,
+    pub version: String,
+    pub image: String,
+    pub mode: String,
+    /// The `*` in the table: the active switch.
+    pub active: bool,
+}
+
+/// What `show version` tells us about a device.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionInfo {
+    /// e.g. `17.15.03`
+    pub version: Option<String>,
+    pub model: Option<String>,
+    pub serial: Option<String>,
+    pub uptime: Option<String>,
+    /// e.g. `flash:packages.conf`
+    pub image: Option<String>,
+    pub last_reload: Option<String>,
+    /// Empty on a standalone switch.
+    pub members: Vec<StackMember>,
+}
+
+impl VersionInfo {
+    /// True when every stack member runs `version`. A stack that came up
+    /// half-upgraded is exactly what this is here to catch.
+    pub fn all_members_run(&self, version: &str) -> bool {
+        !self.members.is_empty() && self.members.iter().all(|m| m.version == version)
+    }
+    /// Versions that differ from the reported system version.
+    pub fn members_off_version(&self) -> Vec<&StackMember> {
+        match &self.version {
+            Some(v) => self.members.iter().filter(|m| &m.version != v).collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Value of a `Label : value` row, if the line is one.
+fn labelled(line: &str, label: &str) -> Option<String> {
+    let (head, value) = line.split_once(':')?;
+    if head.trim().eq_ignore_ascii_case(label) {
+        let v = value.trim();
+        if v.is_empty() {
+            return None;
+        }
+        return Some(v.to_string());
+    }
+    None
+}
+
+/// Parse `show version`. Every field is optional — IOS releases word their
+/// output differently and a missing field must never lose the rest.
+pub fn parse_show_version(output: &str) -> VersionInfo {
+    let mut info = VersionInfo::default();
+    let mut in_stack_table = false;
+
+    for line in output.lines() {
+        let t = line.trim();
+
+        if info.version.is_none() {
+            // "Cisco IOS XE Software, Version 17.15.03"
+            if let Some(rest) = t.strip_prefix("Cisco IOS XE Software, Version ") {
+                info.version = Some(rest.trim().trim_end_matches(',').to_string());
+            }
+        }
+        if info.uptime.is_none() {
+            if let Some((_, rest)) = t.split_once(" uptime is ") {
+                info.uptime = Some(rest.trim().to_string());
+            }
+        }
+        if info.image.is_none() {
+            if let Some(rest) = t.strip_prefix("System image file is ") {
+                info.image = Some(rest.trim().trim_matches('"').to_string());
+            }
+        }
+        if info.last_reload.is_none() {
+            if let Some(v) = labelled(t, "Last reload reason") {
+                info.last_reload = Some(v);
+            }
+        }
+        if info.model.is_none() {
+            if let Some(v) = labelled(t, "Model Number") {
+                info.model = Some(v);
+            } else if let Some(rest) = t.strip_prefix("cisco ") {
+                // "cisco C9200L-48P-4X (ARM64) processor with ..."
+                if t.contains(" processor") {
+                    if let Some(model) = rest.split_whitespace().next() {
+                        info.model = Some(model.to_string());
+                    }
+                }
+            }
+        }
+        if info.serial.is_none() {
+            if let Some(v) = labelled(t, "System Serial Number") {
+                info.serial = Some(v);
+            }
+        }
+
+        // The stack table: header, a rule of dashes, then one row per member.
+        if t.starts_with("Switch ") && t.contains("Ports") && t.contains("SW Version") {
+            in_stack_table = true;
+            continue;
+        }
+        if in_stack_table {
+            if t.is_empty() {
+                in_stack_table = false;
+                continue;
+            }
+            if t.starts_with("---") {
+                continue;
+            }
+            match parse_stack_row(t) {
+                Some(member) => info.members.push(member),
+                // A line that is not a member row ends the table.
+                None => in_stack_table = false,
+            }
+        }
+    }
+    info
+}
+
+/// `*    2 52    C9200L-48P-4X      17.15.03          CAT9K_LITE_IOSXE      INSTALL`
+fn parse_stack_row(line: &str) -> Option<StackMember> {
+    let (active, rest) = match line.strip_prefix('*') {
+        Some(rest) => (true, rest),
+        None => (false, line),
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let [number, _ports, model, version, image, mode] = fields[..] else {
+        return None;
+    };
+    Some(StackMember {
+        number: number.parse().ok()?,
+        model: model.to_string(),
+        version: version.to_string(),
+        image: image.to_string(),
+        mode: mode.to_string(),
+        active,
+    })
+}
+
+/// The device prompt without its trailing `#`/`>`, i.e. the hostname.
+pub fn hostname_from_prompt(prompt: &str) -> Option<String> {
+    let name = prompt.trim().trim_end_matches(['#', '>']).trim();
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::services::ServiceId;
+
+    const SHOW_VERSION: &str = include_str!("../testdata/show_version_c9200l.txt");
+    const DIR_FLASH: &str = include_str!("../testdata/dir_flash.txt");
+
+    #[test]
+    fn reads_flash_totals_from_dir() {
+        let usage = parse_dir_totals(DIR_FLASH).expect("dir footer");
+        assert_eq!(usage.total, 1956839424);
+        assert_eq!(usage.free, 234979328);
+        assert_eq!(usage.used(), 1721860096);
+        assert!((usage.used_fraction() - 0.88).abs() < 0.01);
+        // The image in the listing would not fit a second time.
+        assert!(!usage.fits(504057659));
+        assert!(usage.fits(100 * 1000 * 1000));
+    }
+
+    #[test]
+    fn dir_without_a_footer_is_not_invented() {
+        assert_eq!(parse_dir_totals("Directory of flash:/\nSG#"), None);
+        assert_eq!(parse_dir_totals(""), None);
+        // A truncated footer must not be read as totals.
+        assert_eq!(parse_dir_totals("1956839424 bytes total"), None);
+    }
+
+    #[test]
+    fn reads_the_c9200l_show_version() {
+        let info = parse_show_version(SHOW_VERSION);
+        assert_eq!(info.version.as_deref(), Some("17.15.03"));
+        assert_eq!(info.model.as_deref(), Some("C9200L-48P-4X"));
+        assert_eq!(info.serial.as_deref(), Some("FOC24252FHH"));
+        assert_eq!(info.image.as_deref(), Some("flash:packages.conf"));
+        assert_eq!(info.last_reload.as_deref(), Some("Image Install"));
+        assert_eq!(
+            info.uptime.as_deref(),
+            Some("47 weeks, 6 days, 23 hours, 56 minutes")
+        );
+    }
+
+    #[test]
+    fn reads_every_stack_member() {
+        let info = parse_show_version(SHOW_VERSION);
+        assert_eq!(info.members.len(), 3, "members: {:?}", info.members);
+        assert_eq!(info.members[0].number, 1);
+        assert!(!info.members[0].active);
+        assert!(info.members[1].active, "switch 2 is the active one");
+        assert_eq!(info.members[2].model, "C9200L-48P-4X");
+        for m in &info.members {
+            assert_eq!(m.version, "17.15.03");
+            assert_eq!(m.image, "CAT9K_LITE_IOSXE");
+            assert_eq!(m.mode, "INSTALL");
+        }
+        // This is the switch whose upgrade did not take: everything still
+        // runs the old release, and nothing is off-version relative to it.
+        assert!(info.all_members_run("17.15.03"));
+        assert!(!info.all_members_run("17.15.06"));
+        assert!(info.members_off_version().is_empty());
+    }
+
+    #[test]
+    fn detects_a_half_upgraded_stack() {
+        let mut info = parse_show_version(SHOW_VERSION);
+        info.members[2].version = "17.15.06".into();
+        let odd = info.members_off_version();
+        assert_eq!(odd.len(), 1);
+        assert_eq!(odd[0].number, 3);
+        assert!(!info.all_members_run("17.15.03"));
+    }
+
+    #[test]
+    fn show_version_of_a_standalone_switch() {
+        let text = "Cisco IOS XE Software, Version 17.09.04a\n\
+                    sw1 uptime is 3 days, 2 hours\n\
+                    System image file is \"flash:packages.conf\"\n\
+                    Model Number                       : C9300-24P\n\
+                    System Serial Number               : FOC1234ABCD\n";
+        let info = parse_show_version(text);
+        assert_eq!(info.version.as_deref(), Some("17.09.04a"));
+        assert_eq!(info.model.as_deref(), Some("C9300-24P"));
+        assert!(info.members.is_empty());
+        assert!(!info.all_members_run("17.09.04a"), "no members, no claim");
+    }
+
+    #[test]
+    fn empty_output_yields_nothing() {
+        let info = parse_show_version("");
+        assert_eq!(info, VersionInfo::default());
+    }
+
+    #[test]
+    fn hostname_comes_from_the_prompt() {
+        assert_eq!(hostname_from_prompt("SG-AS-OG5-01#"), Some("SG-AS-OG5-01".into()));
+        assert_eq!(hostname_from_prompt("Switch>"), Some("Switch".into()));
+        assert_eq!(hostname_from_prompt("#"), None);
+        assert_eq!(hostname_from_prompt("a b#"), None);
+    }
 
     fn cfg(privileged: bool) -> Config {
         let mut c = Config::default();

@@ -5,8 +5,9 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Tabs,
 use crate::logging::LogLevel;
 use crate::services::{ServiceId, ServiceStatus};
 use crate::session::{fmt_bytes, fmt_duration, fmt_speed, SessionState};
+use crate::switch::{LineKind, SwitchState};
 
-use super::{theme, DeployField, DeployPhase, DeployView, EditField, Modal, Tab, Ui};
+use super::{theme, DeployField, EditField, Modal, Tab, Ui};
 
 pub fn draw(f: &mut Frame, ui: &mut Ui) {
     // Paint the retro background first; every panel keeps it.
@@ -26,6 +27,7 @@ pub fn draw(f: &mut Frame, ui: &mut Ui) {
         Tab::Files => draw_files(f, ui, chunks[1]),
         Tab::Sessions => draw_sessions(f, ui, chunks[1]),
         Tab::Logs => draw_logs(f, ui, chunks[1]),
+        Tab::Switches => draw_switches(f, ui, chunks[1]),
     }
     draw_footer(f, ui, chunks[2]);
     draw_modal(f, ui);
@@ -102,6 +104,12 @@ fn footer_keys(tab: Tab) -> Vec<(&'static str, &'static str)> {
             ("y", "copy"),
         ],
         Tab::Sessions => vec![("↑↓", "select"), ("B", "bit/byte"), ("←/→", "view")],
+        Tab::Switches => vec![
+            ("Enter", "session"),
+            ("r", "refresh"),
+            ("x", "disconnect"),
+            ("X", "clear closed"),
+        ],
         Tab::Logs => vec![
             ("↑↓", "scroll"),
             ("G", "follow"),
@@ -857,6 +865,7 @@ const HELP_RIGHT: &[(&str, KeyRows)] = &[
             ("3", "files"),
             ("4", "sessions"),
             ("5", "logs"),
+            ("6", "switches"),
             ("← →", "previous / next view"),
             ("Tab", "next view"),
             ("h", "this help"),
@@ -866,13 +875,16 @@ const HELP_RIGHT: &[(&str, KeyRows)] = &[
         ],
     ),
     (
-        "DEPLOY (d in files)",
+        "DEPLOY (d) + SWITCHES (6)",
         &[
-            ("↑ ↓", "form field"),
+            ("↑ ↓", "form field / session"),
             ("← →", "protocol / toggle"),
-            ("Enter", "start the copy"),
-            ("c", "cancel a running copy"),
-            ("r", "back to the form"),
+            ("Enter", "start the copy / open"),
+            ("r", "re-read dir + version"),
+            ("x", "disconnect"),
+            ("X", "clear closed rows"),
+            ("c", "cancel a running job"),
+            ("y", "trust the host key"),
         ],
     ),
     (
@@ -961,42 +973,46 @@ fn draw_help(f: &mut Frame, help_scroll: usize) {
     );
 }
 
-/// The deploy popup: the form before the run, the live SSH transcript during
-/// and after it.
+/// The deploy popup: the form that starts a session. What happens afterwards
+/// is shown by [`draw_session`], which the switches view opens as well.
 fn draw_deploy(f: &mut Frame, ui: &Ui) {
     let Some(view) = &ui.deploy else { return };
     let width = f.area().width.min(112);
-    let height = f.area().height.saturating_sub(2).min(match view.phase {
-        // Fields, the command preview, an optional error and the two hints.
-        DeployPhase::Form => DeployField::ALL.len() as u16 + 9,
-        DeployPhase::HostKey { .. } => 11,
-        _ => 34,
-    });
+    // Fields, the command preview, an optional error and the two hints.
+    let height = f
+        .area()
+        .height
+        .saturating_sub(2)
+        .min(DeployField::ALL.len() as u16 + 10);
     let area = centered_rect(width, height, f.area());
     f.render_widget(Clear, area);
-    let title = format!(" DEPLOY  /{} ", view.rel_path);
-    let block = theme::panel_double(&title);
+    let block = theme::panel_double(&format!(" DEPLOY  /{} ", view.rel_path));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    match &view.phase {
-        DeployPhase::Form => draw_deploy_form(f, ui, view, inner),
-        DeployPhase::HostKey { fingerprint } => draw_deploy_host_key(f, view, fingerprint, inner),
-        _ => draw_deploy_session(f, view, inner),
-    }
-}
-
-fn draw_deploy_form(f: &mut Frame, ui: &Ui, view: &DeployView, area: Rect) {
     let cfg = ui.app.config.read().unwrap();
+    let open_session = ui.app.switches.find_live(
+        view.form.host.trim(),
+        view.form.port.trim().parse().unwrap_or(0),
+        view.form.username.trim(),
+    );
     let mut lines = Vec::new();
     for (i, field) in DeployField::ALL.iter().enumerate() {
         let value = match field {
             DeployField::Host => view.form.host.clone(),
             DeployField::Port => view.form.port.clone(),
             DeployField::Username => view.form.username.clone(),
-            DeployField::Password => "•".repeat(view.form.password.chars().count()),
-            DeployField::EnablePassword => {
-                "•".repeat(view.form.enable_password.chars().count())
+            DeployField::Password | DeployField::EnablePassword => {
+                let typed = if *field == DeployField::Password {
+                    &view.form.password
+                } else {
+                    &view.form.enable_password
+                };
+                if typed.is_empty() && open_session.is_some() {
+                    "— session already open".to_string()
+                } else {
+                    "•".repeat(typed.chars().count())
+                }
             }
             DeployField::Destination => view.form.dest.clone(),
             DeployField::Overwrite => {
@@ -1037,6 +1053,23 @@ fn draw_deploy_form(f: &mut Frame, ui: &Ui, view: &DeployView, area: Rect) {
     }
     drop(cfg);
 
+    // What the device has room for, when a session already told us.
+    if let Some(usage) = open_session.as_ref().and_then(|s| s.facts().flash) {
+        let fits = usage.fits(view.size);
+        lines.push(Line::from(vec![
+            theme::label(" image             "),
+            theme::value(crate::switch::fmt_mb(view.size)),
+            theme::label("   free  "),
+            theme::value(crate::switch::fmt_mb(usage.free)),
+            Span::styled(
+                if fits { "   fits" } else { "   DOES NOT FIT" },
+                Style::default()
+                    .fg(if fits { theme::OK } else { theme::ERR })
+                    .bold(),
+            ),
+        ]));
+    }
+
     lines.push(Line::from(""));
     match super::deploy_command_for(ui, &view.form, &view.rel_path) {
         Ok(cmd) => lines.push(Line::from(vec![
@@ -1069,10 +1102,198 @@ fn draw_deploy_form(f: &mut Frame, ui: &Ui, view: &DeployView, area: Rect) {
     lines.push(Line::from(theme::label(
         " transferbuddy logs in, runs exactly this one copy and leaves — never a config command.",
     )));
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_deploy_host_key(f: &mut Frame, view: &DeployView, fingerprint: &str, area: Rect) {
+/// Live view of one switch session: what it knows about the device, and the
+/// transcript of everything typed and answered.
+fn draw_session(f: &mut Frame, ui: &Ui) {
+    let Some(view) = &ui.session_view else { return };
+    let switch = &view.switch;
+    let width = f.area().width.min(120);
+    let height = f.area().height.saturating_sub(2).min(38);
+    let area = centered_rect(width, height, f.area());
+    f.render_widget(Clear, area);
+    let block = theme::panel_double(&format!(
+        " SWITCH  {}  ({}) ",
+        switch.display_name(),
+        switch.host
+    ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if let SwitchState::HostKey { fingerprint } = switch.state() {
+        draw_host_key(f, switch, &fingerprint, inner);
+        return;
+    }
+
+    let chunks = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    f.render_widget(Paragraph::new(switch_summary(switch)).wrap(Wrap { trim: false }), chunks[0]);
+
+    // Transcript, tail-following unless the user scrolled up.
+    let rows = chunks[1].height.saturating_sub(2) as usize;
+    let transcript = switch.transcript();
+    let live = switch.live();
+    let mut body: Vec<(LineKind, &str)> =
+        transcript.iter().map(|l| (l.kind, l.text.as_str())).collect();
+    if !live.is_empty() {
+        body.push((LineKind::Output, live.as_str()));
+    }
+    let start = match view.scroll {
+        Some(s) => s.min(body.len().saturating_sub(1)),
+        None => body.len().saturating_sub(rows),
+    };
+    let lines: Vec<Line> = body[start..]
+        .iter()
+        .take(rows)
+        .map(|(kind, text)| {
+            let style = match kind {
+                LineKind::Sent => Style::default().fg(theme::ACCENT).bold(),
+                LineKind::Info => Style::default().fg(theme::CYAN),
+                LineKind::Error => Style::default().fg(theme::ERR).bold(),
+                LineKind::Output if text.starts_with('%') => Style::default().fg(theme::WARN),
+                LineKind::Output => Style::default().fg(theme::TEXT),
+            };
+            let marker = if *kind == LineKind::Sent { " > " } else { " " };
+            Line::from(Span::styled(format!("{marker}{text}"), style))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines).block(theme::panel(" SESSION ")),
+        chunks[1],
+    );
+
+    let mut hint = vec![Span::raw(" ")];
+    if matches!(switch.state(), SwitchState::Busy { .. }) {
+        hint.push(theme::key("c"));
+        hint.push(theme::label(" cancel   "));
+    }
+    for (key, desc) in [("r", " refresh   "), ("x", " disconnect   "), ("↑↓", " scroll   ")] {
+        hint.push(theme::key(key));
+        hint.push(theme::label(desc));
+    }
+    hint.push(theme::key("Esc"));
+    hint.push(theme::label(" close"));
+    f.render_widget(Paragraph::new(Line::from(hint)), chunks[2]);
+}
+
+/// Header of the session view: state, device facts, flash and ping.
+fn switch_summary(switch: &crate::switch::Switch) -> Vec<Line<'static>> {
+    let state = switch.state();
+    let (state_text, state_color) = match &state {
+        SwitchState::Busy { what } => (what.clone(), theme::HILITE),
+        SwitchState::Ready => match switch.last_result() {
+            Some(Ok(summary)) => (format!("ready — {summary}"), theme::OK),
+            Some(Err(e)) => (format!("ready — last job failed: {e}"), theme::ERR),
+            None => ("ready".into(), theme::OK),
+        },
+        SwitchState::Failed { reason } | SwitchState::Offline { reason } => {
+            (format!("{} — {reason}", state.label()), theme::ERR)
+        }
+        other => (other.label().to_string(), theme::TEXT),
+    };
+    let facts = switch.facts();
+    let reach = switch.reach();
+
+    let mut lines = vec![Line::from(vec![
+        theme::label(" state    "),
+        Span::styled(state_text, Style::default().fg(state_color).bold()),
+    ])];
+
+    let version = facts.version.clone().unwrap_or_default();
+    lines.push(Line::from(vec![
+        theme::label(" device   "),
+        theme::value(version.model.clone().unwrap_or_else(|| "?".into())),
+        theme::label("   IOS-XE "),
+        Span::styled(
+            version.version.clone().unwrap_or_else(|| "?".into()),
+            Style::default().fg(theme::CYAN).bold(),
+        ),
+        theme::label("   uptime "),
+        theme::value(version.uptime.clone().unwrap_or_else(|| "?".into())),
+    ]));
+
+    let mut third = vec![theme::label(" flash    ")];
+    match facts.flash {
+        Some(usage) => {
+            third.push(Span::styled(
+                crate::switch::fmt_mb(usage.free),
+                Style::default().fg(if usage.used_fraction() > 0.9 {
+                    theme::WARN
+                } else {
+                    theme::OK
+                })
+                .bold(),
+            ));
+            third.push(theme::label(format!(
+                " free of {} ({:.0}% used) on {}",
+                crate::switch::fmt_mb(usage.total),
+                usage.used_fraction() * 100.0,
+                facts.flash_device
+            )));
+        }
+        None => third.push(theme::label("not read yet")),
+    }
+    third.push(theme::label("   ping "));
+    third.push(ping_span(&reach));
+    lines.push(Line::from(third));
+
+    if !version.members.is_empty() {
+        let odd = version.members_off_version();
+        let text = version
+            .members
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}{}:{}",
+                    if m.active { "*" } else { "" },
+                    m.number,
+                    m.version
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        lines.push(Line::from(vec![
+            theme::label(" stack    "),
+            Span::styled(
+                text,
+                Style::default()
+                    .fg(if odd.is_empty() { theme::TEXT } else { theme::WARN })
+                    .bold(),
+            ),
+            theme::label(if odd.is_empty() {
+                ""
+            } else {
+                "   ← members differ from the system version"
+            }),
+        ]));
+    }
+    lines
+}
+
+/// Ping state as one coloured span.
+fn ping_span(reach: &crate::switch::Reach) -> Span<'static> {
+    match (reach.online, reach.rtt, reach.down_since) {
+        (true, Some(rtt), _) => Span::styled(
+            format!("{:.1} ms", rtt.as_secs_f64() * 1000.0),
+            Style::default().fg(theme::OK),
+        ),
+        (true, None, _) => Span::styled("up", Style::default().fg(theme::OK)),
+        (false, _, Some(since)) => Span::styled(
+            format!("down {}", fmt_duration(since.elapsed())),
+            Style::default().fg(theme::ERR).bold(),
+        ),
+        (false, _, None) => Span::styled("—", Style::default().fg(theme::DIM)),
+    }
+}
+
+fn draw_host_key(f: &mut Frame, switch: &crate::switch::Switch, fingerprint: &str, area: Rect) {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -1082,7 +1303,7 @@ fn draw_deploy_host_key(f: &mut Frame, view: &DeployView, fingerprint: &str, are
         Line::from(""),
         Line::from(vec![
             theme::label("   host         "),
-            theme::value(view.form.host.clone()),
+            theme::value(format!("{}:{}", switch.host, switch.port)),
         ]),
         Line::from(vec![
             theme::label("   fingerprint  "),
@@ -1100,85 +1321,120 @@ fn draw_deploy_host_key(f: &mut Frame, view: &DeployView, fingerprint: &str, are
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn draw_deploy_session(f: &mut Frame, view: &DeployView, area: Rect) {
-    let chunks = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(3),
-        Constraint::Length(2),
-    ])
-    .split(area);
-
-    let (state_text, state_color) = match &view.phase {
-        DeployPhase::Done(Ok(summary)) => (format!("✓ {summary}"), theme::OK),
-        DeployPhase::Done(Err(e)) => (format!("✗ {e}"), theme::ERR),
-        _ => (view.stage.clone(), theme::HILITE),
-    };
-    let mut head = vec![Line::from(vec![
-        theme::label(" switch  "),
-        theme::value(format!("{}:{}", view.form.host, view.form.port)),
-        theme::label("   command  "),
-        Span::styled(
-            view.command.clone().unwrap_or_default(),
-            Style::default().fg(theme::CYAN),
-        ),
-    ])];
-    head.push(Line::from(Span::styled(
-        format!(" {state_text}"),
-        Style::default().fg(state_color).bold(),
-    )));
-    f.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), chunks[0]);
-
-    // Transcript, tail-following unless the user scrolled up.
-    let rows = chunks[1].height as usize;
-    let mut body: Vec<&str> = view.transcript.iter().map(String::as_str).collect();
-    if !view.live.is_empty() {
-        body.push(view.live.as_str());
+/// The switches view: one row per open SSH session to a device.
+fn draw_switches(f: &mut Frame, ui: &mut Ui, area: Rect) {
+    let switches = ui.app.switches.list();
+    if ui.switch_sel >= switches.len() {
+        ui.switch_sel = switches.len().saturating_sub(1);
     }
-    let start = match view.scroll {
-        Some(s) => s.min(body.len().saturating_sub(1)),
-        None => body.len().saturating_sub(rows),
-    };
-    let lines: Vec<Line> = body[start..]
+
+    let header = Row::new(vec![
+        Cell::from("name"),
+        Cell::from("host"),
+        Cell::from("user"),
+        Cell::from("state"),
+        Cell::from("IOS-XE"),
+        Cell::from("model"),
+        Cell::from("flash free"),
+        Cell::from("ping"),
+        Cell::from("open"),
+    ])
+    .style(theme::header());
+
+    let rows: Vec<Row> = switches
         .iter()
-        .take(rows)
-        .map(|l| {
-            let style = if let Some(rest) = l.strip_prefix("> ") {
-                let _ = rest;
-                Style::default().fg(theme::ACCENT).bold()
-            } else if l.starts_with('%') {
-                Style::default().fg(theme::ERR)
-            } else {
-                Style::default().fg(theme::TEXT)
+        .enumerate()
+        .map(|(i, sw)| {
+            let state = sw.state();
+            let facts = sw.facts();
+            let version = facts.version.clone().unwrap_or_default();
+            let state_style = match &state {
+                SwitchState::Ready => Style::default().fg(theme::OK),
+                SwitchState::Busy { .. } => Style::default().fg(theme::HILITE).bold(),
+                SwitchState::Failed { .. } | SwitchState::Offline { .. } => {
+                    Style::default().fg(theme::ERR)
+                }
+                _ => Style::default().fg(theme::WARN),
             };
-            Line::from(Span::styled(format!(" {l}"), style))
+            let flash = match facts.flash {
+                Some(u) => format!(
+                    "{} ({:.0}%)",
+                    crate::switch::fmt_mb(u.free),
+                    u.used_fraction() * 100.0
+                ),
+                None => "—".into(),
+            };
+            let row = Row::new(vec![
+                Cell::from(sw.display_name()),
+                Cell::from(format!("{}:{}", sw.host, sw.port)),
+                Cell::from(sw.username.clone()),
+                Cell::from(state.label()).style(state_style),
+                Cell::from(version.version.clone().unwrap_or_else(|| "—".into())),
+                Cell::from(version.model.clone().unwrap_or_else(|| "—".into())),
+                Cell::from(flash),
+                Cell::from(Line::from(ping_span(&sw.reach()))),
+                Cell::from(fmt_duration(sw.opened.elapsed())),
+            ]);
+            if i == ui.switch_sel {
+                row.style(theme::selected())
+            } else {
+                row
+            }
         })
         .collect();
+
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(7)]).split(area);
+    let widths = [
+        Constraint::Length(20),
+        Constraint::Length(22),
+        Constraint::Length(12),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(16),
+        Constraint::Length(18),
+        Constraint::Length(10),
+        Constraint::Min(6),
+    ];
     f.render_widget(
-        Paragraph::new(lines).block(theme::panel(" SESSION ")),
-        chunks[1],
+        Table::new(rows, widths)
+            .header(header)
+            .block(theme::panel(" SWITCH SESSIONS ")),
+        chunks[0],
     );
 
-    let hint = match &view.phase {
-        DeployPhase::Done(_) => vec![
-            Span::raw(" "),
-            theme::key("r"),
-            theme::label(" deploy again   "),
-            theme::key("↑↓"),
-            theme::label(" scroll   "),
-            theme::key("Esc"),
-            theme::label(" close"),
-        ],
-        _ => vec![
-            Span::raw(" "),
-            theme::key("c"),
-            theme::label(" cancel   "),
-            theme::key("↑↓"),
-            theme::label(" scroll   "),
-            theme::key("G"),
-            theme::label(" follow"),
+    let detail = match switches.get(ui.switch_sel) {
+        Some(sw) => {
+            let mut lines = switch_summary(sw);
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                theme::key("Enter"),
+                theme::label(" open the session   "),
+                theme::key("r"),
+                theme::label(" refresh facts   "),
+                theme::key("x"),
+                theme::label(" disconnect   "),
+                theme::key("X"),
+                theme::label(" clear closed"),
+            ]));
+            lines
+        }
+        None => vec![
+            Line::from(""),
+            Line::from(theme::label(
+                "  No session yet. Open one from the files view: select a file and press d.",
+            )),
+            Line::from(theme::label(
+                "  A session stays open after the copy — it is what tracks the install later.",
+            )),
         ],
     };
-    f.render_widget(Paragraph::new(Line::from(hint)), chunks[2]);
+    f.render_widget(
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: false })
+            .block(theme::panel(" DEVICE ")),
+        chunks[1],
+    );
 }
 
 fn draw_modal(f: &mut Frame, ui: &Ui) {
@@ -1350,6 +1606,7 @@ fn draw_modal(f: &mut Frame, ui: &Ui) {
             );
         }
         Modal::Deploy => draw_deploy(f, ui),
+        Modal::Session => draw_session(f, ui),
         Modal::Hashes => {
             let mut lines = Vec::new();
             if let Some(info) = &ui.hashes {
@@ -1419,6 +1676,7 @@ mod tests {
         cfg.http.port = 8080;
         cfg.http.bind = "0.0.0.0".into();
         let logger = Arc::new(crate::logging::Logger::new(LogLevel::Debug, None, false));
+        let logger2 = logger.clone();
         let sessions = Arc::new(crate::session::SessionManager::new(600));
         let services = crate::services::ServiceManager::new(
             rt.handle().clone(),
@@ -1430,6 +1688,7 @@ mod tests {
             logger,
             sessions,
             services,
+            switches: crate::switch::SwitchManager::new(rt.handle().clone(), logger2),
             privileged: false,
             runtime: rt.handle().clone(),
         });
@@ -1454,7 +1713,30 @@ mod tests {
             hashes: None,
             help_scroll: 0,
             deploy: None,
+            session_view: None,
+            switch_sel: 0,
         }
+    }
+
+    /// A session with realistic facts, as the C9200L reports them.
+    fn test_switch(state: crate::switch::SwitchState) -> std::sync::Arc<crate::switch::Switch> {
+        let version = crate::cisco::parse_show_version(include_str!(
+            "../../testdata/show_version_c9200l.txt"
+        ));
+        let flash = crate::cisco::parse_dir_totals(include_str!("../../testdata/dir_flash.txt"));
+        let facts = crate::switch::Facts {
+            hostname: Some("SG-AS-OG5-01".into()),
+            version: Some(version),
+            flash,
+            flash_device: "flash:".into(),
+            updated: None,
+        };
+        let transcript = vec![
+            crate::switch::Line { kind: LineKind::Info, text: "connecting to 10.20.30.40:22".into() },
+            crate::switch::Line { kind: LineKind::Sent, text: "terminal length 0".into() },
+            crate::switch::Line { kind: LineKind::Output, text: "SG-AS-OG5-01#".into() },
+        ];
+        crate::switch::Switch::for_test("10.20.30.40", state, facts, transcript)
     }
 
     /// Render the whole TUI into a test terminal and return it as plain text.
@@ -1514,7 +1796,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_modal_renders_every_phase() {
+    fn deploy_form_renders_with_a_command_preview() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("image.bin"), b"x").unwrap();
         let (_rt, app) = test_app(dir.path().to_path_buf());
@@ -1526,40 +1808,86 @@ mod tests {
         form.host = "10.20.30.40".into();
         form.username = "netadmin".into();
         form.password = "letmein".into();
-        ui.deploy = Some(super::super::DeployView::for_test("image.bin", form));
+        ui.deploy = Some(super::super::DeployView {
+            rel_path: "image.bin".into(),
+            size: 504_057_659,
+            form,
+            error: None,
+        });
 
-        // The form shows every field, the resulting command and the promise
-        // that nothing else is run.
         let screen = render_ui(&mut ui);
         for label in DeployField::ALL.iter().map(|f| f.label()) {
             assert!(screen.contains(label), "form is missing {label}");
         }
         assert!(screen.contains("copy http://"), "no command preview");
         assert!(screen.contains("never a config"), "missing the safety note");
-        // Passwords are masked.
         assert!(!screen.contains("letmein"), "password shown in clear");
+    }
 
-        // Host key confirmation.
-        let view = ui.deploy.as_mut().unwrap();
-        view.phase = DeployPhase::HostKey { fingerprint: "SHA256:abc123".into() };
+    #[test]
+    fn session_modal_shows_facts_and_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        ui.modal = Some(Modal::Session);
+
+        // Busy: the header names the job, the flash figure is in MB and the
+        // stack members are listed.
+        let switch = test_switch(crate::switch::SwitchState::Busy {
+            what: "copying cat9k_lite_iosxe.17.15.06.SPA.bin".into(),
+        });
+        ui.session_view = Some(super::super::SessionView {
+            switch: switch.clone(),
+            scroll: None,
+            jobs_seen: 0,
+        });
+        let screen = render_ui(&mut ui);
+        assert!(screen.contains("SG-AS-OG5-01"), "no device name");
+        assert!(screen.contains("copying cat9k"), "no job label");
+        assert!(screen.contains("235 MB free of 1957 MB"), "flash not in MB: {screen}");
+        assert!(screen.contains("17.15.03"), "no IOS version");
+        assert!(screen.contains("C9200L-48P-4X"), "no model");
+        assert!(screen.contains("*2:17.15.03"), "no stack members");
+        assert!(screen.contains("terminal length 0"), "no transcript");
+        assert!(screen.contains("1.2 ms"), "no ping");
+
+        // The host key question replaces the whole body.
+        ui.session_view.as_mut().unwrap().switch =
+            test_switch(crate::switch::SwitchState::HostKey {
+                fingerprint: "SHA256:abc123".into(),
+            });
         let screen = render_ui(&mut ui);
         assert!(screen.contains("SHA256:abc123"), "no fingerprint");
+        assert!(screen.contains("unknown host key"), "no warning");
+    }
 
-        // Running session with a transcript.
-        let view = ui.deploy.as_mut().unwrap();
-        view.phase = DeployPhase::Running;
-        view.stage = "copying".into();
-        view.command = Some("copy http://10.0.0.1/image.bin flash:".into());
-        view.transcript = vec!["> terminal length 0".into(), "cat9k-1#".into()];
-        view.live = "!!!!!!".into();
-        let screen = render_ui(&mut ui);
-        assert!(screen.contains("copying") && screen.contains("!!!!!!"), "{screen}");
+    #[test]
+    fn switches_view_lists_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        ui.tab = Tab::Switches;
 
-        // Result.
-        let view = ui.deploy.as_mut().unwrap();
-        view.phase = DeployPhase::Done(Ok("521510912 bytes copied in 231.402 secs".into()));
+        // Empty: the view explains how to get a session.
         let screen = render_ui(&mut ui);
-        assert!(screen.contains("bytes copied in"), "no summary");
+        assert!(screen.contains("SWITCH SESSIONS"), "no table");
+        assert!(screen.contains("press d"), "no hint for the empty view");
+
+        // A half-upgraded stack must stand out in the detail pane.
+        let switch = test_switch(crate::switch::SwitchState::Ready);
+        switch.facts_for_test(|f| {
+            if let Some(v) = f.version.as_mut() {
+                v.members[2].version = "17.15.06".into();
+            }
+        });
+        ui.session_view = Some(super::super::SessionView {
+            switch,
+            scroll: None,
+            jobs_seen: 0,
+        });
+        ui.modal = Some(Modal::Session);
+        let screen = render_ui(&mut ui);
+        assert!(screen.contains("members differ"), "half-upgraded stack not flagged");
     }
 
     #[test]
@@ -1626,8 +1954,9 @@ mod tests {
         // Not everything fits, so the last entries are off-screen ...
         assert!(!short.contains("protocol filter"));
         assert!(short.contains("scroll"));
-        // ... and scrolling brings them in.
-        let scrolled = render_help(120, 20, 14).join("\n");
+        // ... and scrolling to the bottom brings them in. The scroll is
+        // clamped, so this stays right as the tables grow.
+        let scrolled = render_help(120, 20, usize::MAX).join("\n");
         assert!(scrolled.contains("protocol filter"));
     }
 

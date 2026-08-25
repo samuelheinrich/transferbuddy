@@ -11,6 +11,7 @@ mod services;
 mod session;
 mod sound;
 mod sshkeys;
+mod switch;
 mod tui;
 
 use std::process::ExitCode;
@@ -23,6 +24,7 @@ use crate::config::Config;
 use crate::logging::{LogLevel, Logger};
 use crate::services::{ServiceId, ServiceManager};
 use crate::session::SessionManager;
+use crate::switch::SwitchManager;
 
 /// User-visible version: major.minor only (0.1, 0.2, 0.3, ...). The patch
 /// component of the Cargo version is an implementation detail Cargo requires.
@@ -38,6 +40,8 @@ pub struct App {
     pub logger: Arc<Logger>,
     pub sessions: Arc<SessionManager>,
     pub services: ServiceManager,
+    /// Open SSH sessions to network devices.
+    pub switches: SwitchManager,
     pub privileged: bool,
     /// Handle of the async runtime, so the (synchronous) TUI can spawn work
     /// such as a deploy session.
@@ -79,11 +83,13 @@ fn main() -> ExitCode {
     };
 
     let services = ServiceManager::new(runtime.handle().clone(), logger.clone(), sessions.clone());
+    let switches = SwitchManager::new(runtime.handle().clone(), logger.clone());
     let app: SharedApp = Arc::new(App {
         config: std::sync::RwLock::new(config),
         logger: logger.clone(),
         sessions: sessions.clone(),
         services,
+        switches,
         privileged,
         runtime: runtime.handle().clone(),
     });
@@ -124,8 +130,9 @@ fn main() -> ExitCode {
         }
     };
 
-    // Graceful shutdown of all listeners.
+    // Graceful shutdown of all listeners and device sessions.
     app.services.stop_all();
+    app.switches.disconnect_all();
     runtime.shutdown_timeout(std::time::Duration::from_secs(3));
     ExitCode::from(code)
 }

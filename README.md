@@ -24,8 +24,11 @@ copy with a single keypress.
 - **Ready-to-paste Cisco commands** for every enabled protocol, with the right
   IP, port and credentials — one keypress to the clipboard.
 - **Deploy from the file browser:** `d` opens an SSH session to the switch and
-  runs the `copy` for you — and nothing else. transferbuddy can type four kinds
+  runs the `copy` for you — and nothing else. transferbuddy can type six kinds
   of line on a device and a configuration command is not one of them.
+- **Switch sessions that stay open:** a session survives the copy, keeps
+  reading free flash space, IOS version and stack members, and is watched by a
+  ping monitor — the groundwork for tracking an install across a reload.
 - **Live session view:** progress, current and average speed, ETA, per-protocol
   counters.
 - **Fixed, known credentials** (`cisco` / `cisco123`) — nothing random to look
@@ -223,28 +226,36 @@ from the device side — no console, no copy-paste:
 will be typed — the source address is the local IP that actually routes to the
 switch, so a multi-homed machine advertises the right one.
 
-From there the popup turns into a live transcript: what transferbuddy sent
+From there the popup turns into the live session view: what transferbuddy sent
 (`>`), what the device answered, and the `!!!!` progress marks of the running
-`copy`. `c` cancels, `↑↓` scrolls, `r` returns to the form for the next file.
-The transfer also shows up in the sessions view like any other download,
-because that is what it is.
+`copy`, above a header with the device's facts. `c` cancels, `↑↓` scrolls, `r`
+re-reads the facts, `x` disconnects. The transfer also shows up in the sessions
+view like any other download, because that is what it is.
+
+The session does **not** end with the copy. It stays open, appears in the
+[switches view](#6--switches) and is ready for the next file — the second
+deploy to the same switch needs no password at all.
 
 **What transferbuddy is allowed to do on your switch**
 
 The whole point of the feature is that it stays inside a very small box. Every
-line that goes to a device passes a whitelist, and the whitelist has four
+line that goes to a device passes a whitelist, and the whitelist has six
 entries:
 
 | Line | Why |
 |------|-----|
 | `terminal length 0` | otherwise the output stops at `--More--` |
 | `enable` | `copy` needs privileged EXEC — skipped when the login is already at `#` |
+| `show version` | IOS version, model, serial, uptime, stack members |
+| `dir <device>:` | free flash space, read before and after every copy |
 | `copy <transferbuddy URL> <device>:` | the actual transfer |
 | `exit` | leave the session cleanly |
 
-Everything else is refused before a byte is sent: `configure terminal`,
-`write`, `reload`, `delete`, `erase`, `format`, a `copy` into `running-config`
-or `startup-config`, a second command chained with `;` or `|`. The copy
+The two read-only ones are just as narrow as the rest: only `show version`, no
+other `show`, and `dir` only on a storage device. Everything else is refused
+before a byte is sent: `configure terminal`, `write`, `reload`, `delete`,
+`erase`, `format`, `show running-config`, a `copy` into `running-config` or
+`startup-config`, a second command chained with `;` or `|`. The copy
 destination must be a storage device (`flash:`, `bootflash:`, `usbflash0:`,
 `disk0:`, …).
 
@@ -257,8 +268,8 @@ answers it can send are Enter and `n`.
 
 Passwords are typed only at a `Password:` prompt, are shown as `••••` in the
 form, as `********` in the transcript and never reach the log or `config.toml`.
-They are cleared after every run — host, user, protocol and destination are
-kept so the next file takes two keystrokes.
+They are cleared from the form the moment the session has them — host, user,
+protocol and destination are kept, so the next file takes two keystrokes.
 
 On the first connection the device's host key is shown as a SHA-256
 fingerprint and, once accepted with `y`, stored in
@@ -281,6 +292,42 @@ level (`L`) and protocol filter (`P`). From the services view, `L` jumps
 straight to the log filtered to that protocol.
 
 ![transferbuddy log view](docs/screenshots/logs.svg)
+
+### 6 · Switches
+
+Every SSH session transferbuddy holds open to a device, one per row: name (the
+device's own hostname, taken from its prompt), address, user, state, IOS-XE
+version, model, free flash and the current ping. The pane below shows the
+selected device in full, including the stack members.
+
+```
+name             host              user      state   IOS-XE    model          flash free      ping
+SG-AS-OG5-01     10.20.30.40:22    netadmin  ready   17.15.03  C9200L-48P-4X  235 MB (88%)    1.2 ms
+
+ state    ready — 504057659 bytes copied in 728.176 secs (692220 bytes/sec)
+ device   C9200L-48P-4X   IOS-XE 17.15.03   uptime 47 weeks, 6 days, 23 hours
+ flash    235 MB free of 1957 MB (88% used) on flash:   ping 1.2 ms
+ stack    1:17.15.03  *2:17.15.03  3:17.15.03
+```
+
+`Enter` opens the session with its full transcript, `r` re-reads `dir` and
+`show version`, `x` disconnects, `X` drops closed rows from the list.
+
+**Free flash space** comes from the footer `dir` prints —
+`1956839424 bytes total (234979328 bytes free)` — and is shown in MB, with how
+much of the device is used. It is read when a session opens and again after
+every copy, so the number on screen is the one that matters for the next
+image. When a session is open, the deploy form compares the file against it
+and says outright whether the image still fits.
+
+**The stack row** lists every member with its software version, the active one
+marked `*`. Members that do not match the system version are highlighted —
+that is the case where an upgrade only took on part of a stack.
+
+**The ping monitor** checks every device every five seconds and shows the
+round-trip time, or how long the device has been unreachable. That is what
+makes a reload visible from here, and it is the mechanism the install
+tracking will use to catch a switch the moment it comes back.
 
 ### Help
 
@@ -441,8 +488,8 @@ intro         = true   # animated intro screen on start
 | `q` | quit (asks to stop running services) |
 | `h` / `?` | help (two key tables, one key per line) |
 | `m` | sound on/off |
-| `Tab` / `1`–`5` | switch view |
-| `f` / `a` / `l` / `c` | files / sessions / logs / services |
+| `Tab` / `1`–`6` | switch view |
+| `f` / `a` / `l` / `c` / `w` | files / sessions / logs / services / switches |
 | arrows / `j` `k` | navigate |
 | `Enter` | open directory / show Cisco commands / select |
 | `Space` | enable/disable service |
@@ -458,7 +505,9 @@ intro         = true   # animated intro screen on start
 | `B` | toggle bit/s ↔ byte/s (Sessions) |
 | `G` | follow log tail |
 | `H` | file hashes (MD5/SHA-256/SHA-512) with compare |
-| `c` | cancel a running deploy (Deploy) |
+| `c` | cancel a running job (Switches) |
+| `r` | re-read dir + show version (Switches) |
+| `x` / `X` | disconnect / clear closed sessions (Switches) |
 | `L` | log level (Logs) · logs of the selected service (Services) |
 | `P` | protocol filter (Logs) |
 
@@ -503,12 +552,14 @@ use) · `2` invalid configuration/arguments.
 | Deploy says "… is not running" | the deploy only uses services you started — press `s` on the protocol in the services view |
 | Deploy stops at "unexpected prompt" | the device asked something transferbuddy will not answer on its own; the transcript shows the question. Run that `copy` by hand |
 | Deploy fails with "host key … changed" | remove the named line from `state/known_hosts` if the device really was replaced |
+| Flash space shows `—` | the session has not read `dir` yet, or the device answered something unexpected — press `r` in the switches view |
+| Ping always shows `—` | transferbuddy shells out to the system `ping`; a firewall dropping ICMP looks the same as a device being down |
 | Wrong directory shared | the root always follows the working directory — check the dashboard's `root:` line, and `--root` if you passed it. Older builds pinned the root in `config.toml`; the stale `root =` key is now ignored, so re-installing is enough |
 
 ## Development
 
 ```bash
-cargo run -- --http --no-tui --root ./testdata   # run from source
+cargo run -- --http --no-tui --root ./images     # run from source
 cargo test                                       # unit + integration tests
 cargo fmt && cargo clippy                        # style & lints
 ```
@@ -520,7 +571,8 @@ src/
 ├── main.rs        # startup, headless mode
 ├── cli.rs         # clap argument parser
 ├── config.rs      # config.toml model, CLI merge, validation
-├── deploy.rs      # SSH client to the switch + the command whitelist
+├── deploy.rs      # the command whitelist: what may be typed on a device
+├── switch.rs      # long-lived SSH sessions, device facts, ping monitor
 ├── fsroot.rs      # SecureRoot: path traversal & symlink jail
 ├── session.rs     # SessionManager: live transfer metrics
 ├── services/      # ServiceManager + one adapter per protocol
@@ -530,7 +582,7 @@ src/
 │   └── tftp.rs    #   TFTP with blksize/tsize options
 ├── tui/           # ratatui views (no protocol dependencies)
 │   ├── mod.rs     #   state, key handling
-│   ├── views.rs   #   all five views and the modals
+│   ├── views.rs   #   all six views and the modals
 │   ├── theme.rs   #   Atari-flavoured palette and panel helpers
 │   └── intro.rs   #   block-letter intro animation
 ├── sound.rs       # short beeps for TUI toggles
@@ -538,8 +590,10 @@ src/
 ├── certs.rs       # self-signed TLS certificates
 ├── sshkeys.rs     # SSH host key management
 ├── netif.rs       # interface detection & IP suggestion
-├── cisco.rs       # copy-command generator
+├── cisco.rs       # copy-command generator, dir/show-version parsers
 └── logging.rs     # structured log entries, ring buffer, file sink
+
+testdata/          # recorded device output the parsers are tested against
 ```
 
 Every protocol adapter implements the same lifecycle (`run(ctx)` with a

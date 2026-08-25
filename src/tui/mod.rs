@@ -4,7 +4,7 @@ mod views;
 
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -13,20 +13,14 @@ use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, K
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
 
-use crate::deploy::{DeployEvent, DeployRequest};
 use crate::logging::{Event, LogLevel};
 use crate::services::ServiceId;
 use crate::session::Protocol;
 use crate::sound::Tone;
+use crate::switch::{Job, Switch, SwitchState, Target};
 use crate::SharedApp;
 
-/// How long a deploy waits for the TCP/SSH handshake, for one command to be
-/// answered, and for the whole `copy` to finish.
-const DEPLOY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const DEPLOY_STEP_TIMEOUT: Duration = Duration::from_secs(30);
-const DEPLOY_COPY_TIMEOUT: Duration = Duration::from_secs(45 * 60);
-/// Transcript lines kept in memory; a long copy prints a lot of bangs.
-const DEPLOY_TRANSCRIPT_MAX: usize = 1000;
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -35,10 +29,18 @@ pub enum Tab {
     Files,
     Sessions,
     Logs,
+    Switches,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::Dashboard, Tab::Services, Tab::Files, Tab::Sessions, Tab::Logs];
+    pub const ALL: [Tab; 6] = [
+        Tab::Dashboard,
+        Tab::Services,
+        Tab::Files,
+        Tab::Sessions,
+        Tab::Logs,
+        Tab::Switches,
+    ];
     pub fn title(self) -> &'static str {
         match self {
             Tab::Dashboard => "1 Dashboard",
@@ -46,6 +48,7 @@ impl Tab {
             Tab::Files => "3 Files",
             Tab::Sessions => "4 Sessions",
             Tab::Logs => "5 Logs",
+            Tab::Switches => "6 Switches",
         }
     }
 }
@@ -300,74 +303,25 @@ impl Default for DeployForm {
     }
 }
 
-/// Where a deploy currently is.
-pub enum DeployPhase {
-    /// Filling in the form.
-    Form,
-    /// Waiting for the user to accept an unknown host key.
-    HostKey { fingerprint: String },
-    /// SSH session is running.
-    Running,
-    /// Finished — `Ok` carries the device's summary line.
-    Done(std::result::Result<String, String>),
-}
-
-/// Everything the deploy modal shows and owns.
+/// The deploy form for one file. The live session it starts lives in
+/// [`crate::switch`] and is shown by [`Modal::Session`].
 pub struct DeployView {
     /// File being deployed, relative to the shared root.
     pub rel_path: String,
+    /// Its size, to compare against the free flash of the device.
+    pub size: u64,
     pub form: DeployForm,
-    pub phase: DeployPhase,
-    /// Coarse phase text for the modal header.
-    pub stage: String,
-    /// The session transcript, oldest first.
-    pub transcript: Vec<String>,
-    /// The device's current, unfinished output line.
-    pub live: String,
-    /// Rows scrolled away at the top; `None` = follow the tail.
-    pub scroll: Option<usize>,
     /// Problem with the form, shown in red under the fields.
     pub error: Option<String>,
-    /// The command that will be typed on the device.
-    pub command: Option<String>,
-    rx: Option<tokio::sync::mpsc::UnboundedReceiver<DeployEvent>>,
-    cancel: Arc<AtomicBool>,
-    host_key_reply: Option<tokio::sync::oneshot::Sender<bool>>,
 }
 
-impl DeployView {
-    fn push(&mut self, line: String) {
-        self.transcript.push(line);
-        if self.transcript.len() > DEPLOY_TRANSCRIPT_MAX {
-            let cut = self.transcript.len() - DEPLOY_TRANSCRIPT_MAX;
-            self.transcript.drain(..cut);
-            if let Some(s) = self.scroll.as_mut() {
-                *s = s.saturating_sub(cut);
-            }
-        }
-    }
-    pub fn is_running(&self) -> bool {
-        matches!(self.phase, DeployPhase::Running | DeployPhase::HostKey { .. })
-    }
-
-    /// A view with no session attached, for rendering tests.
-    #[cfg(test)]
-    pub fn for_test(rel_path: &str, form: DeployForm) -> Self {
-        Self {
-            rel_path: rel_path.to_string(),
-            form,
-            phase: DeployPhase::Form,
-            stage: String::new(),
-            transcript: Vec::new(),
-            live: String::new(),
-            scroll: None,
-            error: None,
-            command: None,
-            rx: None,
-            cancel: Arc::new(AtomicBool::new(false)),
-            host_key_reply: None,
-        }
-    }
+/// The live view of one switch session.
+pub struct SessionView {
+    pub switch: Arc<Switch>,
+    /// Rows scrolled away at the top; `None` = follow the tail.
+    pub scroll: Option<usize>,
+    /// Number of finished jobs already announced, so each one beeps once.
+    pub jobs_seen: u64,
 }
 
 pub enum Modal {
@@ -383,8 +337,11 @@ pub enum Modal {
     /// File hash view; the data lives in `Ui::hashes` so it survives the
     /// detour through the compare-input modal.
     Hashes,
-    /// Deploy form / live SSH session; the data lives in `Ui::deploy`.
+    /// Deploy form; the data lives in `Ui::deploy`.
     Deploy,
+    /// Live transcript of one switch session; the data lives in
+    /// `Ui::session_view`.
+    Session,
 }
 
 pub struct Ui {
@@ -405,9 +362,13 @@ pub struct Ui {
     pub hashes: Option<HashInfo>,
     /// Scroll offset of the help modal (it is taller than short terminals).
     pub help_scroll: usize,
-    /// Deploy form and running session, kept across modal opens so host and
-    /// user do not have to be retyped for the next file.
+    /// Deploy form, kept across modal opens so host and user do not have to
+    /// be retyped for the next file.
     pub deploy: Option<DeployView>,
+    /// The switch session shown by [`Modal::Session`].
+    pub session_view: Option<SessionView>,
+    /// Selected row in the switches view.
+    pub switch_sel: usize,
 }
 
 impl Ui {
@@ -459,12 +420,14 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: Sha
         hashes: None,
         help_scroll: 0,
         deploy: None,
+        session_view: None,
+        switch_sel: 0,
     };
     let root = ui.app.config.read().unwrap().root.clone();
     ui.files.refresh(&root);
 
     loop {
-        pump_deploy(&mut ui);
+        pump_session(&mut ui);
         terminal.draw(|f| views::draw(f, &mut ui))?;
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
@@ -489,8 +452,10 @@ fn handle_key(ui: &mut Ui, key: KeyEvent) {
     }
     match key.code {
         KeyCode::Char('q') => {
-            let any_running =
-                ServiceId::ALL.iter().any(|id| ui.app.services.status(*id).is_running());
+            let any_running = ServiceId::ALL
+                .iter()
+                .any(|id| ui.app.services.status(*id).is_running())
+                || ui.app.switches.list().iter().any(|s| s.state().is_live());
             if any_running {
                 ui.modal = Some(Modal::ConfirmQuit);
             } else {
@@ -533,12 +498,16 @@ fn handle_key(ui: &mut Ui, key: KeyEvent) {
         }
         KeyCode::Char('4') | KeyCode::Char('a') => ui.tab = Tab::Sessions,
         KeyCode::Char('5') | KeyCode::Char('l') => ui.tab = Tab::Logs,
+        KeyCode::Char('6') | KeyCode::Char('w') if ui.tab != Tab::Services => {
+            ui.tab = Tab::Switches
+        }
         _ => match ui.tab {
             Tab::Dashboard => {}
             Tab::Services => handle_services_key(ui, key),
             Tab::Files => handle_files_key(ui, key),
             Tab::Sessions => handle_sessions_key(ui, key),
             Tab::Logs => handle_logs_key(ui, key),
+            Tab::Switches => handle_switches_key(ui, key),
         },
     }
 }
@@ -740,7 +709,7 @@ fn handle_files_key(ui: &mut Ui, key: KeyEvent) {
                 if entry.is_dir {
                     ui.status_msg = Some("deploy works on files, not directories".into());
                 } else {
-                    open_deploy_modal(ui, &entry.name);
+                    open_deploy_modal(ui, &entry.name, entry.size);
                 }
             }
         }
@@ -861,7 +830,7 @@ const DEPLOY_PROTOCOLS: [Protocol; 6] = [
 
 /// Open the deploy form for one file. Host, user and destination from the
 /// previous deploy are kept; the passwords are not.
-fn open_deploy_modal(ui: &mut Ui, name: &str) {
+fn open_deploy_modal(ui: &mut Ui, name: &str, size: u64) {
     let rel = if ui.files.cwd.is_empty() {
         name.to_string()
     } else {
@@ -874,20 +843,7 @@ fn open_deploy_modal(ui: &mut Ui, name: &str) {
     if form.username.is_empty() {
         form.proto = default_deploy_protocol(ui);
     }
-    ui.deploy = Some(DeployView {
-        rel_path: rel,
-        form,
-        phase: DeployPhase::Form,
-        stage: String::new(),
-        transcript: Vec::new(),
-        live: String::new(),
-        scroll: None,
-        error: None,
-        command: None,
-        rx: None,
-        cancel: Arc::new(AtomicBool::new(false)),
-        host_key_reply: None,
-    });
+    ui.deploy = Some(DeployView { rel_path: rel, size, form, error: None });
     ui.modal = Some(Modal::Deploy);
 }
 
@@ -933,12 +889,15 @@ fn redact_url_password(cmd: &str) -> String {
     }
 }
 
-/// Validate the form and hand the session to the runtime.
+/// Show a switch session, following its tail.
+fn open_session_view(ui: &mut Ui, switch: Arc<Switch>) {
+    ui.session_view = Some(SessionView { jobs_seen: switch.jobs_done(), switch, scroll: None });
+    ui.modal = Some(Modal::Session);
+}
+
+/// Validate the form, open (or reuse) the session and queue the copy.
 fn start_deploy(ui: &mut Ui) {
     let Some(view) = ui.deploy.as_ref() else { return };
-    if view.is_running() {
-        return;
-    }
     let form = view.form.clone();
     let rel = view.rel_path.clone();
 
@@ -957,10 +916,13 @@ fn start_deploy(ui: &mut Ui) {
         Ok(p) if p > 0 => p,
         _ => return fail(ui, format!("invalid ssh port: {:?}", form.port)),
     };
-    if form.username.trim().is_empty() {
+    let username = form.username.trim().to_string();
+    if username.is_empty() {
         return fail(ui, "enter the username for the switch".into());
     }
-    if form.password.is_empty() {
+    // An open session already holds the credentials.
+    let existing = ui.app.switches.find_live(&host, port, &username);
+    if existing.is_none() && form.password.is_empty() {
         return fail(ui, "enter the password for the switch".into());
     }
 
@@ -979,35 +941,36 @@ fn start_deploy(ui: &mut Ui) {
         Ok(c) => c,
         Err(e) => return fail(ui, e),
     };
-    let known_hosts = ui
-        .app
-        .config
-        .read()
-        .unwrap()
-        .config_dir
-        .join("state")
-        .join("known_hosts");
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let request = DeployRequest {
-        host: host.clone(),
-        port,
-        username: form.username.trim().to_string(),
-        password: form.password.clone(),
-        enable_password: form.enable_password.clone(),
+    let switch = match existing {
+        Some(sw) => sw,
+        None => {
+            let known_hosts = ui
+                .app
+                .config
+                .read()
+                .unwrap()
+                .config_dir
+                .join("state")
+                .join("known_hosts");
+            ui.app.switches.connect(Target {
+                host: host.clone(),
+                port,
+                username,
+                password: form.password.clone(),
+                enable_password: form.enable_password.clone(),
+                known_hosts,
+            })
+        }
+    };
+    switch.submit(Job::Copy {
+        rel_path: rel.clone(),
         command: command.clone(),
         overwrite: form.overwrite,
-        known_hosts,
-        connect_timeout: DEPLOY_CONNECT_TIMEOUT,
-        step_timeout: DEPLOY_STEP_TIMEOUT,
-        copy_timeout: DEPLOY_COPY_TIMEOUT,
-    };
-    ui.app
-        .runtime
-        .spawn(crate::deploy::run(request, tx, cancel.clone()));
+    });
+
     let mut ev = Event::new(LogLevel::Info, "deploy", format!("start on {host}"))
-        .path(rel.clone())
+        .path(rel)
         .result(redact_url_password(&command));
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         ev = ev.ip(ip);
@@ -1016,90 +979,38 @@ fn start_deploy(ui: &mut Ui) {
 
     if let Some(v) = ui.deploy.as_mut() {
         v.error = None;
-        v.command = Some(command);
-        v.transcript.clear();
-        v.live.clear();
-        v.scroll = None;
-        v.stage = "starting".into();
-        v.phase = DeployPhase::Running;
-        v.rx = Some(rx);
-        v.cancel = cancel;
-        v.host_key_reply = None;
+        // The session holds them now; the form must not.
+        v.form.password.clear();
+        v.form.enable_password.clear();
     }
+    open_session_view(ui, switch);
 }
 
-/// Drain the deploy channel into the view. Called once per UI frame.
-fn pump_deploy(ui: &mut Ui) {
-    let Some(view) = ui.deploy.as_mut() else { return };
-    let events: Vec<DeployEvent> = {
-        let Some(rx) = view.rx.as_mut() else { return };
-        let mut out = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            out.push(ev);
-            if out.len() >= 2000 {
-                break;
-            }
-        }
-        out
-    };
-    if events.is_empty() {
+/// Announce finished jobs of the session on screen once each.
+fn pump_session(ui: &mut Ui) {
+    let Some(view) = ui.session_view.as_mut() else { return };
+    let done = view.switch.jobs_done();
+    if done == view.jobs_seen {
         return;
     }
-    let mut finished = None;
-    for ev in events {
-        match ev {
-            DeployEvent::Stage(text) => view.stage = text,
-            DeployEvent::Sent(text) => view.push(format!("> {text}")),
-            DeployEvent::Output(line) => view.push(line),
-            DeployEvent::Live(line) => view.live = line,
-            DeployEvent::HostKey { fingerprint, reply } => {
-                view.host_key_reply = Some(reply);
-                view.phase = DeployPhase::HostKey { fingerprint };
-            }
-            DeployEvent::Finished(result) => {
-                view.live.clear();
-                view.rx = None;
-                view.stage = match &result {
-                    Ok(_) => "done".into(),
-                    Err(_) => "failed".into(),
-                };
-                view.form.password.clear();
-                view.form.enable_password.clear();
-                view.phase = DeployPhase::Done(result.clone());
-                finished = Some(result);
-            }
-        }
-    }
-    if let Some(result) = finished {
-        let (level, tone) = match &result {
-            Ok(_) => (LogLevel::Info, Tone::Confirm),
-            Err(_) => (LogLevel::Error, Tone::Error),
-        };
-        let (host, rel) = ui
-            .deploy
-            .as_ref()
-            .map(|v| (v.form.host.clone(), v.rel_path.clone()))
-            .unwrap_or_default();
-        let ev = Event::new(level, "deploy", format!("finished on {host}")).path(rel);
-        let ev = match &result {
-            Ok(summary) => ev.result(summary.clone()),
-            Err(e) => ev.error(e.clone()),
-        };
-        ui.app.logger.log(ev);
-        ui.beep(tone);
-    }
-}
-
-/// Answer the host-key question and let the SSH handshake continue.
-fn answer_host_key(ui: &mut Ui, accept: bool) {
-    let Some(view) = ui.deploy.as_mut() else { return };
-    if let Some(reply) = view.host_key_reply.take() {
-        let _ = reply.send(accept);
-    }
-    view.phase = DeployPhase::Running;
-    if !accept {
-        view.push("host key rejected".into());
-    }
+    view.jobs_seen = done;
+    let (result, host, name) = (
+        view.switch.last_result(),
+        view.switch.host.clone(),
+        view.switch.display_name(),
+    );
+    let Some(result) = result else { return };
+    let (level, tone) = match &result {
+        Ok(_) => (LogLevel::Info, Tone::Confirm),
+        Err(_) => (LogLevel::Error, Tone::Error),
+    };
+    let ev = Event::new(level, "deploy", format!("finished on {name}")).path(host);
+    let ev = match &result {
+        Ok(summary) => ev.result(summary.clone()),
+        Err(e) => ev.error(e.clone()),
+    };
+    ui.app.logger.log(ev);
+    ui.beep(tone);
 }
 
 fn handle_deploy_key(ui: &mut Ui, key: KeyEvent) {
@@ -1107,75 +1018,78 @@ fn handle_deploy_key(ui: &mut Ui, key: KeyEvent) {
         ui.modal = None;
         return;
     };
-    match &view.phase {
-        DeployPhase::HostKey { .. } => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => answer_host_key(ui, true),
-            _ => answer_host_key(ui, false),
-        },
-        DeployPhase::Running => match key.code {
-            KeyCode::Char('c') => {
-                view.cancel.store(true, Ordering::Relaxed);
-                view.push("cancelling …".into());
+    let fields = DeployField::ALL;
+    let cur = fields[view.form.field.min(fields.len() - 1)];
+    match key.code {
+        KeyCode::Esc => ui.modal = None,
+        KeyCode::Enter => start_deploy(ui),
+        KeyCode::Up | KeyCode::BackTab => view.form.field = view.form.field.saturating_sub(1),
+        KeyCode::Down | KeyCode::Tab => {
+            view.form.field = (view.form.field + 1).min(fields.len() - 1)
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if !cur.is_text() => {
+            match cur {
+                DeployField::Overwrite => view.form.overwrite = !view.form.overwrite,
+                _ => {
+                    let i = DEPLOY_PROTOCOLS
+                        .iter()
+                        .position(|p| *p == view.form.proto)
+                        .unwrap_or(0);
+                    let n = DEPLOY_PROTOCOLS.len();
+                    let step = if key.code == KeyCode::Left { n - 1 } else { 1 };
+                    view.form.proto = DEPLOY_PROTOCOLS[(i + step) % n];
+                }
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
-                ui.status_msg = Some("deploy is running — c cancels it".into());
-            }
-            _ => scroll_deploy(view, key),
-        },
-        DeployPhase::Done(_) => match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => ui.modal = None,
-            KeyCode::Char('r') => {
-                view.phase = DeployPhase::Form;
+            view.error = None;
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if cur.is_text() {
+                field_buffer(&mut view.form, cur).push(c);
                 view.error = None;
             }
-            _ => scroll_deploy(view, key),
-        },
-        DeployPhase::Form => {
-            let fields = DeployField::ALL;
-            let cur = fields[view.form.field.min(fields.len() - 1)];
-            match key.code {
-                KeyCode::Esc => ui.modal = None,
-                KeyCode::Enter => start_deploy(ui),
-                KeyCode::Up | KeyCode::BackTab => {
-                    view.form.field = view.form.field.saturating_sub(1)
-                }
-                KeyCode::Down | KeyCode::Tab => {
-                    view.form.field = (view.form.field + 1).min(fields.len() - 1)
-                }
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
-                    if !cur.is_text() =>
-                {
-                    match cur {
-                        DeployField::Overwrite => {
-                            view.form.overwrite = !view.form.overwrite;
-                        }
-                        _ => {
-                            let i = DEPLOY_PROTOCOLS
-                                .iter()
-                                .position(|p| *p == view.form.proto)
-                                .unwrap_or(0);
-                            let n = DEPLOY_PROTOCOLS.len();
-                            let step = if key.code == KeyCode::Left { n - 1 } else { 1 };
-                            view.form.proto = DEPLOY_PROTOCOLS[(i + step) % n];
-                        }
-                    }
-                    view.error = None;
-                }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if cur.is_text() {
-                        field_buffer(&mut view.form, cur).push(c);
-                        view.error = None;
-                    }
-                }
-                KeyCode::Backspace => {
-                    if cur.is_text() {
-                        field_buffer(&mut view.form, cur).pop();
-                        view.error = None;
-                    }
-                }
-                _ => {}
+        }
+        KeyCode::Backspace => {
+            if cur.is_text() {
+                field_buffer(&mut view.form, cur).pop();
+                view.error = None;
             }
         }
+        _ => {}
+    }
+}
+
+fn handle_session_key(ui: &mut Ui, key: KeyEvent) {
+    let Some(view) = ui.session_view.as_mut() else {
+        ui.modal = None;
+        return;
+    };
+    let switch = view.switch.clone();
+    if let SwitchState::HostKey { .. } = switch.state() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => switch.answer_host_key(true),
+            KeyCode::Esc => ui.modal = None,
+            _ => switch.answer_host_key(false),
+        }
+        return;
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => ui.modal = None,
+        KeyCode::Char('c') => {
+            if matches!(switch.state(), SwitchState::Busy { .. }) {
+                switch.cancel();
+                ui.status_msg = Some("cancelling — the session is closed with it".into());
+            }
+        }
+        KeyCode::Char('r') => {
+            if switch.submit(Job::Facts) {
+                ui.status_msg = Some("re-reading dir and show version".into());
+            }
+        }
+        KeyCode::Char('x') => {
+            switch.submit(Job::Disconnect);
+            ui.status_msg = Some("disconnecting".into());
+        }
+        _ => scroll_session(view, key),
     }
 }
 
@@ -1192,8 +1106,8 @@ fn field_buffer(form: &mut DeployForm, field: DeployField) -> &mut String {
     }
 }
 
-fn scroll_deploy(view: &mut DeployView, key: KeyEvent) {
-    let len = view.transcript.len();
+fn scroll_session(view: &mut SessionView, key: KeyEvent) {
+    let len = view.switch.transcript().len();
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
             let cur = view.scroll.unwrap_or(len);
@@ -1216,6 +1130,47 @@ fn scroll_deploy(view: &mut DeployView, key: KeyEvent) {
     }
 }
 
+/// The switch the cursor is on in the switches view.
+fn selected_switch(ui: &Ui) -> Option<Arc<Switch>> {
+    let list = ui.app.switches.list();
+    list.get(ui.switch_sel.min(list.len().saturating_sub(1))).cloned()
+}
+
+fn handle_switches_key(ui: &mut Ui, key: KeyEvent) {
+    let count = ui.app.switches.list().len();
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => ui.switch_sel = ui.switch_sel.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            if count > 0 {
+                ui.switch_sel = (ui.switch_sel + 1).min(count - 1);
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(sw) = selected_switch(ui) {
+                open_session_view(ui, sw);
+            }
+        }
+        KeyCode::Char('r') => {
+            if let Some(sw) = selected_switch(ui) {
+                if sw.submit(Job::Facts) {
+                    ui.status_msg = Some(format!("re-reading facts of {}", sw.display_name()));
+                }
+            }
+        }
+        KeyCode::Char('x') => {
+            if let Some(sw) = selected_switch(ui) {
+                sw.submit(Job::Disconnect);
+                ui.status_msg = Some(format!("disconnecting {}", sw.display_name()));
+            }
+        }
+        KeyCode::Char('X') => {
+            ui.app.switches.forget_closed();
+            ui.switch_sel = 0;
+            ui.status_msg = Some("closed sessions removed".into());
+        }
+        _ => {}
+    }
+}
 fn handle_sessions_key(ui: &mut Ui, key: KeyEvent) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => ui.session_sel = ui.session_sel.saturating_sub(1),
@@ -1303,6 +1258,7 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
         Some(Modal::ConfirmQuit) => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 ui.app.services.stop_all();
+                ui.app.switches.disconnect_all();
                 ui.should_quit = true;
             }
             _ => {}
@@ -1426,6 +1382,11 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
         Some(Modal::Deploy) => {
             ui.modal = modal;
             handle_deploy_key(ui, key);
+            return;
+        }
+        Some(Modal::Session) => {
+            ui.modal = modal;
+            handle_session_key(ui, key);
             return;
         }
         Some(Modal::Hashes) => match key.code {

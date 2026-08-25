@@ -1,0 +1,10 @@
+SG-AS-OG5-01#dir flash:
+Directory of flash:/
+
+  1  drwx           4096   Sep 23 2025 20:52:11 +02:00  .installer
+602  -rw-      504057659   Aug 25 2026 18:41:02 +02:00  cat9k_lite_iosxe.17.15.06.SPA.bin
+603  -rw-           1783   Sep 23 2025 20:55:41 +02:00  packages.conf
+  6  -rw-             30   Sep 23 2025 20:52:29 +02:00  throughput_monitor_params
+
+1956839424 bytes total (234979328 bytes free)
+SG-AS-OG5-01#
