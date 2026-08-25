@@ -11,6 +11,11 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub root: Option<PathBuf>,
 
+    /// Local interface or address to put into generated URLs (e.g. en5),
+    /// for a machine with more than one network
+    #[arg(long, value_name = "NAME|IP")]
+    pub interface: Option<String>,
+
     /// Enable the HTTP service
     #[arg(long)]
     pub http: bool,

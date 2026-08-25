@@ -23,6 +23,8 @@ copy with a single keypress.
   shared directory, each individually startable.
 - **Ready-to-paste Cisco commands** for every enabled protocol, with the right
   IP, port and credentials — one keypress to the clipboard.
+- **You pick the address:** on a laptop on cable *and* Wi-Fi, `i` decides which
+  interface ends up in the generated URLs, and the choice is remembered.
 - **Deploy from the file browser:** `d` opens an SSH session to the switch and
   runs the `copy` for you — and nothing else. transferbuddy can type six kinds
   of line on a device and a configuration command is not one of them.
@@ -163,8 +165,8 @@ the whole thing with `--no-intro` (or `intro = false` in `config.toml`).
 
 ### 1 · Dashboard
 
-Everything at a glance: shared root, the local address to type into the switch,
-the credentials, transfer totals and the log file location. Below it the
+Everything at a glance: shared root, the local address that goes into generated
+URLs, the credentials, transfer totals and the log file location. Below it the
 service table with status, port, bind address, active sessions, uptime and a
 clear **CLEARTEXT** / encrypted marker. The bottom half has quick panels for
 files, sessions and local interfaces, plus a full-width live log block.
@@ -343,6 +345,44 @@ different one for off, a third for a rejected value. `m` mutes them (the
 indicator top right switches from `♪` to `×`), as does `--no-sound`. The
 setting is remembered.
 
+## Which address ends up in the URLs
+
+Services bind to `0.0.0.0` by default, so they answer on every interface — but
+a generated `copy` command can only carry one address. On a machine with cable
+*and* Wi-Fi the automatic choice is whichever physical interface comes first,
+which is rarely the one you meant.
+
+`i` cycles it, in the dashboard and in the copy-command popup, where the
+commands update as you go:
+
+```
+address in URLs:   10.41.10.108  (en12 pinned, i changes it)
+
+INTERFACES
+→ en12    10.41.10.108  physical
+  en0     10.40.40.56   physical
+  utun40  198.19.254.2  tunnel
+```
+
+The choice is written to `config.toml` (`advertise = "en12"`) and survives a
+restart. The same thing without the TUI:
+
+```bash
+transferbuddy --http --interface en12     # or --interface 10.41.10.108
+transferbuddy --http --no-tui             # lists every interface it could use
+```
+
+An interface that no longer exists is refused at startup with the list of the
+ones that do, and if it disappears while running, transferbuddy falls back to
+the automatic choice instead of handing out a dead address.
+
+Two things still win over this setting, because they have to:
+
+- **A service bound to one address** (`--bind 192.168.1.10`) is only reachable
+  there, so that address goes into its URLs regardless.
+- **A deploy to a known switch** uses the address the routing table picks for
+  that device — unless you pinned one, in which case yours is used.
+
 ## Ports and sudo
 
 transferbuddy detects whether it runs with root privileges and picks the
@@ -476,6 +516,7 @@ key left over from an older version is ignored.
 Beyond ports and services, `config.toml` also holds the UI preferences:
 
 ```toml
+advertise     = "en12" # interface for generated URLs (absent = automatic)
 speed_in_bits = true   # show speeds in bit/s instead of byte/s
 sound         = true   # beeps when toggling settings (m in the TUI)
 intro         = true   # animated intro screen on start
@@ -488,6 +529,7 @@ intro         = true   # animated intro screen on start
 | `q` | quit (asks to stop running services) |
 | `h` / `?` | help (two key tables, one key per line) |
 | `m` | sound on/off |
+| `i` | interface used in generated URLs |
 | `Tab` / `1`–`6` | switch view |
 | `f` / `a` / `l` / `c` / `w` | files / sessions / logs / services / switches |
 | arrows / `j` `k` | navigate |
@@ -521,6 +563,7 @@ transferbuddy [OPTIONS]
                         enable services (SFTP/SCP share one SSH service)
 --port-http <P> --port-https <P> --port-ftp <P> --port-sftp <P> --port-tftp <P>
 --bind <ADDR>           bind address for all services (default 0.0.0.0)
+--interface <NAME|IP>   local interface whose address goes into generated URLs
 --username <U>          FTP/SFTP/SCP user (default: cisco)
 --password <P>          FTP/SFTP/SCP password (default: cisco123)
 --uploads               allow uploads (off by default)
@@ -544,7 +587,7 @@ use) · `2` invalid configuration/arguments.
 |---------|-----|
 | `port 80 needs root privileges` | run with `sudo` or use `--port-http 8080` |
 | `port 8080 is already in use` | another server is running — pick a different port |
-| Device can't reach the server | check the bind address; the dashboard lists all local interfaces. VPN/tunnel interfaces are not used for suggestions |
+| Device can't reach the server | the URL carries one address and it may be the wrong interface — press `i` (or use `--interface`) to pin the one the device is on |
 | `copy tftp:` times out | IOS talks to port 69 only — run `sudo transferbuddy --tftp` |
 | `copy https:` fails on the device | the self-signed certificate isn't trusted; install it as a trustpoint or use HTTP |
 | SCP/SFTP host key error on device | the host key changed; clear the old known-host entry on the device |

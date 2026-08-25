@@ -76,6 +76,7 @@ fn footer_keys(tab: Tab) -> Vec<(&'static str, &'static str)> {
             ("q", "quit"),
             ("h", "help"),
             ("m", "sound"),
+            ("i", "address"),
             ("←/→", "view"),
         ],
         Tab::Services => vec![
@@ -176,18 +177,19 @@ fn draw_dashboard(f: &mut Frame, ui: &Ui, area: Rect) {
     let cfg = ui.app.config.read().unwrap();
     let (completed, bytes) = ui.app.sessions.totals();
     let active = ui.app.sessions.active_count();
-    let suggested = crate::netif::suggest_ip()
-        .map(|i| i.to_string())
-        .unwrap_or_else(|| "-".into());
+    let (advertised, advertised_source) = super::advertised_now(ui);
+    let advertised = advertised.map(|i| i.to_string()).unwrap_or_else(|| "-".into());
     let summary = vec![
         Line::from(vec![
             theme::label("root:              "),
             theme::value(cfg.root.display().to_string()),
         ]),
         Line::from(vec![
-            theme::label("suggested address: "),
-            Span::styled(suggested, Style::default().fg(theme::HILITE).bold()),
-            theme::label("   privileged: "),
+            theme::label("address in URLs:   "),
+            Span::styled(advertised, Style::default().fg(theme::HILITE).bold()),
+            theme::label(format!("  ({advertised_source}, ")),
+            theme::key("i"),
+            theme::label(" changes it)   privileged: "),
             theme::value(if ui.app.privileged { "yes (sudo)" } else { "no" }),
         ]),
         Line::from(vec![
@@ -351,16 +353,32 @@ fn draw_dashboard(f: &mut Frame, ui: &Ui, area: Rect) {
         cols[1],
     );
 
+    let (in_use, _) = super::advertised_now(ui);
+    let pinned = ui.app.config.read().unwrap().advertise.is_some();
     let mut if_lines = Vec::new();
     for ifa in crate::netif::interfaces().into_iter().take(6) {
+        let active = Some(ifa.ip) == in_use;
         if_lines.push(Line::from(vec![
             Span::styled(
+                if active { "→ " } else { "  " },
+                Style::default().fg(theme::HILITE).bold(),
+            ),
+            Span::styled(
                 format!("{:<7} {}", ifa.name, ifa.ip),
-                Style::default().fg(theme::TEXT),
+                if active {
+                    Style::default().fg(theme::HILITE).bold()
+                } else {
+                    Style::default().fg(theme::TEXT)
+                },
             ),
             theme::label(format!("  {}", ifa.kind.label())),
         ]));
     }
+    if_lines.push(Line::from(vec![
+        Span::raw("  "),
+        theme::key("i"),
+        theme::label(if pinned { " pinned — cycle" } else { " pin an interface" }),
+    ]));
     f.render_widget(
         Paragraph::new(if_lines).block(theme::panel(" INTERFACES ")),
         cols[2],
@@ -869,6 +887,7 @@ const HELP_RIGHT: &[(&str, KeyRows)] = &[
             ("← →", "previous / next view"),
             ("Tab", "next view"),
             ("h", "this help"),
+            ("i", "address used in URLs"),
             ("m", "sound on / off"),
             ("q", "quit"),
             ("^C", "quit"),
@@ -1508,11 +1527,31 @@ fn draw_modal(f: &mut Frame, ui: &Ui) {
             );
         }
         Modal::Cisco { rel_path, commands, selected, copied } => {
-            let mut lines = vec![Line::from(vec![
-                theme::label("copy commands for "),
-                Span::styled(format!("/{rel_path}"), Style::default().fg(theme::CYAN).bold()),
-                theme::label("   (↑↓ select, y/Enter copy, Esc close)"),
-            ])];
+            let (ip, source) = super::advertised_now(ui);
+            let mut lines = vec![
+                Line::from(vec![
+                    theme::label("copy commands for "),
+                    Span::styled(format!("/{rel_path}"), Style::default().fg(theme::CYAN).bold()),
+                    theme::label("   (↑↓ select, y/Enter copy, Esc close)"),
+                ]),
+                Line::from(vec![
+                    theme::label("from "),
+                    Span::styled(
+                        ip.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
+                        Style::default().fg(theme::HILITE).bold(),
+                    ),
+                    theme::label(format!(" ({source})   ")),
+                    theme::key("i"),
+                    theme::label(" cycles:  "),
+                    theme::label(
+                        crate::netif::candidates()
+                            .iter()
+                            .map(|c| format!("{} {}", c.name, c.ip))
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    ),
+                ]),
+            ];
             for (i, (proto, cmd)) in commands.iter().enumerate() {
                 let style = if i == *selected {
                     theme::selected()
@@ -1533,8 +1572,8 @@ fn draw_modal(f: &mut Frame, ui: &Ui) {
                     Style::default().fg(theme::OK).bold(),
                 )));
             }
-            let width = (f.area().width).min(100);
-            let area = centered_rect(width, commands.len() as u16 + 4, f.area());
+            let width = (f.area().width).min(120);
+            let area = centered_rect(width, commands.len() as u16 + 5, f.area());
             f.render_widget(Clear, area);
             f.render_widget(
                 Paragraph::new(lines).block(theme::panel_double(" CISCO COPY ")),
@@ -1782,6 +1821,16 @@ mod tests {
         assert!(log_row.trim_end().chars().count() >= 118, "log block is not full width");
         // Credentials are the fixed defaults.
         assert!(dash.contains("cisco / cisco123"), "unexpected credentials");
+        // The address generated URLs use is named, with where it came from,
+        // and the interface it belongs to is marked in the list.
+        assert!(dash.contains("address in URLs"), "no advertised address");
+        if let (Some(ip), _) = super::super::advertised_now(&ui) {
+            assert!(dash.contains(&ip.to_string()), "address not shown");
+            let marked = dash
+                .lines()
+                .find(|l| l.contains('→') && l.contains(&ip.to_string()));
+            assert!(marked.is_some(), "advertised interface not marked");
+        }
 
         for modal in [
             Modal::Help,

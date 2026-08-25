@@ -190,9 +190,18 @@ fn print_status(app: &SharedApp) {
     println!("transferbuddy v{}", crate::VERSION);
     println!("  root:              {}", cfg.root.display());
     println!(
-        "  suggested address: {}",
-        netif::suggest_ip().map(|i| i.to_string()).unwrap_or_else(|| "-".into())
+        "  address in URLs:   {}{}",
+        cfg.advertised_ip("0.0.0.0", None)
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "-".into()),
+        match &cfg.advertise {
+            Some(pin) => format!("  ({pin}, pinned with --interface)"),
+            None => "  (automatic — pin one with --interface)".into(),
+        }
     );
+    for ifa in netif::candidates() {
+        println!("    {:<8} {:<16} {}", ifa.name, ifa.ip.to_string(), ifa.kind.label());
+    }
     for id in ServiceId::ALL {
         let sc = cfg.service(id);
         let status = app.services.status(id);

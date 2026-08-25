@@ -102,24 +102,48 @@ pub fn interfaces() -> Vec<NetInterface> {
     out
 }
 
-/// Best local IPv4 to put into generated Cisco copy commands: prefer
-/// physical interfaces, never loopback/tunnel/VM unless nothing else exists.
-pub fn suggest_ip() -> Option<IpAddr> {
+/// Interfaces a device could realistically be told to connect to: IPv4, not
+/// loopback. This is the list the address selector cycles through.
+pub fn candidates() -> Vec<NetInterface> {
     interfaces()
         .into_iter()
         .filter(|i| i.ip.is_ipv4() && i.kind != IfKind::Loopback)
-        .min_by_key(|i| i.kind.rank())
+        .collect()
+}
+
+/// Best local IPv4 to put into generated Cisco copy commands: prefer
+/// physical interfaces, never loopback/tunnel/VM unless nothing else exists.
+///
+/// On a laptop on Wi-Fi *and* cable both are `Physical`, so the tie is broken
+/// by the interface order — which is why the address can be pinned, see
+/// [`resolve_advertise`].
+pub fn suggest_ip() -> Option<IpAddr> {
+    candidates().into_iter().min_by_key(|i| i.kind.rank()).map(|i| i.ip)
+}
+
+/// Resolve a configured preference — an interface name (`en5`) or a literal
+/// address — against the interfaces that exist right now. `None` when the
+/// interface is gone or the address is no longer configured, so a stale
+/// setting falls back instead of producing an unreachable URL.
+pub fn resolve_advertise(setting: &str) -> Option<IpAddr> {
+    let setting = setting.trim();
+    if setting.is_empty() {
+        return None;
+    }
+    let all = interfaces();
+    if let Ok(ip) = setting.parse::<IpAddr>() {
+        return all.iter().find(|i| i.ip == ip).map(|i| i.ip);
+    }
+    // Prefer IPv4 of that interface; fall back to whatever it has.
+    all.iter()
+        .find(|i| i.name == setting && i.ip.is_ipv4())
+        .or_else(|| all.iter().find(|i| i.name == setting))
         .map(|i| i.ip)
 }
 
-/// The address devices should use to reach a service bound to `bind`.
-#[allow(dead_code)] // public helper, exercised in tests
-pub fn effective_ip(bind: &str) -> Option<IpAddr> {
-    match bind.parse::<IpAddr>() {
-        Ok(ip) if ip.is_unspecified() => suggest_ip(),
-        Ok(ip) => Some(ip),
-        Err(_) => suggest_ip(),
-    }
+/// The interface an address belongs to, for display.
+pub fn interface_of(ip: &IpAddr) -> Option<String> {
+    interfaces().into_iter().find(|i| &i.ip == ip).map(|i| i.name)
 }
 
 /// The local address the kernel would use to reach `peer`, asked by opening
@@ -138,16 +162,25 @@ pub fn source_ip_for(peer: &IpAddr) -> Option<IpAddr> {
     Some(ip)
 }
 
-/// Address a device at `peer` should use for a service bound to `bind`:
-/// an explicit bind address wins, otherwise the route towards the device
-/// decides, and only then the generic suggestion.
-pub fn advertised_ip(bind: &str, peer: Option<&IpAddr>) -> Option<IpAddr> {
+/// Address a device at `peer` should use for a service bound to `bind`.
+///
+/// A service bound to one address can only be reached there, so that wins.
+/// After it comes the address the user pinned, then the route towards the
+/// device, and only then the generic suggestion.
+pub fn advertised_ip(
+    advertise: Option<&str>,
+    bind: &str,
+    peer: Option<&IpAddr>,
+) -> Option<IpAddr> {
     if let Ok(ip) = bind.parse::<IpAddr>() {
         if !ip.is_unspecified() {
             return Some(ip);
         }
     }
-    peer.and_then(source_ip_for).or_else(suggest_ip)
+    advertise
+        .and_then(resolve_advertise)
+        .or_else(|| peer.and_then(source_ip_for))
+        .or_else(suggest_ip)
 }
 
 #[cfg(test)]
@@ -176,16 +209,57 @@ mod tests {
     }
 
     #[test]
-    fn effective_ip_uses_bind_when_concrete() {
-        assert_eq!(effective_ip("192.168.1.10"), Some(v4("192.168.1.10")));
+    fn advertised_ip_prefers_an_explicit_bind() {
+        let peer = v4("10.1.2.3");
+        assert_eq!(
+            advertised_ip(None, "192.168.1.10", Some(&peer)),
+            Some(v4("192.168.1.10"))
+        );
+        // A bound address wins even over a pinned one — only there is anyone
+        // actually listening.
+        assert_eq!(
+            advertised_ip(Some("en0"), "192.168.1.10", Some(&peer)),
+            Some(v4("192.168.1.10"))
+        );
+        // A wildcard bind falls through.
+        assert_ne!(advertised_ip(None, "0.0.0.0", Some(&peer)), Some(v4("0.0.0.0")));
     }
 
     #[test]
-    fn advertised_ip_prefers_an_explicit_bind() {
+    fn a_pinned_interface_wins_over_the_automatic_choice() {
+        let Some(pick) = candidates().into_iter().next() else {
+            return; // no network on this machine
+        };
         let peer = v4("10.1.2.3");
-        assert_eq!(advertised_ip("192.168.1.10", Some(&peer)), Some(v4("192.168.1.10")));
-        // A wildcard bind falls through to the route towards the peer.
-        assert_ne!(advertised_ip("0.0.0.0", Some(&peer)), Some(v4("0.0.0.0")));
+        assert_eq!(
+            advertised_ip(Some(&pick.name), "0.0.0.0", Some(&peer)),
+            Some(pick.ip)
+        );
+        // Pinning the literal address works the same way.
+        assert_eq!(
+            advertised_ip(Some(&pick.ip.to_string()), "0.0.0.0", Some(&peer)),
+            Some(pick.ip)
+        );
+        assert_eq!(interface_of(&pick.ip).as_deref(), Some(pick.name.as_str()));
+    }
+
+    #[test]
+    fn a_stale_pin_falls_back_instead_of_lying() {
+        assert_eq!(resolve_advertise("en-does-not-exist"), None);
+        assert_eq!(resolve_advertise("203.0.113.99"), None);
+        assert_eq!(resolve_advertise(""), None);
+        // ... and the caller still gets a usable address.
+        assert_eq!(
+            advertised_ip(Some("en-does-not-exist"), "0.0.0.0", None),
+            suggest_ip()
+        );
+    }
+
+    #[test]
+    fn candidates_are_never_loopback() {
+        for c in candidates() {
+            assert!(c.ip.is_ipv4() && !c.ip.is_loopback(), "{c:?}");
+        }
     }
 
     #[test]

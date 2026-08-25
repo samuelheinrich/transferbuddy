@@ -29,6 +29,12 @@ pub struct Config {
     pub uploads: UploadConfig,
     pub tls: TlsConfig,
 
+    /// Which local address generated URLs use when a service is bound to
+    /// `0.0.0.0`: an interface name (`en5`), a literal address, or `None` for
+    /// the automatic choice. A laptop on cable *and* Wi-Fi is the reason this
+    /// exists.
+    pub advertise: Option<String>,
+
     pub log_level: LogLevel,
     pub log_to_file: bool,
     pub log_file: Option<PathBuf>,
@@ -122,6 +128,7 @@ impl Default for Config {
             auth: AuthConfig::default(),
             uploads: UploadConfig::default(),
             tls: TlsConfig::default(),
+            advertise: None,
             log_level: LogLevel::Info,
             log_to_file: true,
             log_file: None,
@@ -250,6 +257,9 @@ impl Config {
             self.tftp.port = p;
         }
 
+        if let Some(iface) = &cli.interface {
+            self.advertise = Some(iface.clone());
+        }
         if let Some(bind) = &cli.bind {
             bind.parse::<std::net::IpAddr>()
                 .map_err(|_| anyhow::anyhow!("invalid bind address: {bind}"))?;
@@ -330,6 +340,18 @@ impl Config {
                 .parse::<std::net::IpAddr>()
                 .map_err(|_| anyhow::anyhow!("invalid bind address for {}: {}", id.display_name(), sc.bind))?;
         }
+        if let Some(iface) = &self.advertise {
+            if crate::netif::resolve_advertise(iface).is_none() {
+                bail!(
+                    "no local interface or address {iface:?} — available: {}",
+                    crate::netif::candidates()
+                        .iter()
+                        .map(|i| format!("{} ({})", i.name, i.ip))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
         if self.uploads.enabled {
             let dir = self.upload_dir_abs();
             if let Ok(meta) = std::fs::metadata(&dir) {
@@ -339,6 +361,12 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Address a device should be told to fetch from, for a service bound to
+    /// `bind`. `peer` is the device's own address when it is known.
+    pub fn advertised_ip(&self, bind: &str, peer: Option<&std::net::IpAddr>) -> Option<std::net::IpAddr> {
+        crate::netif::advertised_ip(self.advertise.as_deref(), bind, peer)
     }
 
     pub fn upload_dir_abs(&self) -> PathBuf {

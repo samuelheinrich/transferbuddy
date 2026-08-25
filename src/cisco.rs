@@ -37,11 +37,16 @@ pub fn service_of(proto: Protocol) -> ServiceId {
 /// The source URL a device uses to fetch `rel_path` from transferbuddy.
 /// `needs_port` reports whether the port had to be spelled out.
 fn source_url(proto: Protocol, cfg: &Config, ip: &IpAddr, rel_path: &str) -> (String, bool) {
-    let host = fmt_ip(ip);
+    let sc = cfg.service(service_of(proto));
+    // A service bound to one address can only be reached there, whatever the
+    // caller suggests.
+    let host = match sc.bind.parse::<IpAddr>() {
+        Ok(bound) if !bound.is_unspecified() => fmt_ip(&bound),
+        _ => fmt_ip(ip),
+    };
     let user = &cfg.auth.username;
     let pass = &cfg.auth.password;
     let rel = rel_path.trim_start_matches('/');
-    let sc = cfg.service(service_of(proto));
     let needs_port = sc.port != cisco_default_port(proto);
     let port_part = if needs_port { format!(":{}", sc.port) } else { String::new() };
     let url = match proto {
@@ -515,6 +520,23 @@ mod tests {
         // And the whitelist still applies to the destination.
         assert!(deploy_command(Protocol::Http, &c, &ip(), "img.bin", "running-config").is_err());
         assert!(deploy_command(Protocol::Http, &c, &ip(), "img.bin", "").is_err());
+    }
+
+    #[test]
+    fn a_bound_service_advertises_its_own_address() {
+        let mut c = cfg(false);
+        c.http.bind = "10.9.9.9".into();
+        // The suggestion is ignored: nothing listens on it for this service.
+        assert_eq!(
+            copy_command(Protocol::Http, &c, &ip(), "img.bin"),
+            "copy http://10.9.9.9:8080/img.bin flash:"
+        );
+        // A wildcard bind keeps using the advertised address.
+        c.https.bind = "0.0.0.0".into();
+        assert_eq!(
+            copy_command(Protocol::Https, &c, &ip(), "img.bin"),
+            "copy https://192.168.1.10:8443/img.bin flash:"
+        );
     }
 
     #[test]

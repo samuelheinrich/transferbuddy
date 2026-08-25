@@ -501,6 +501,7 @@ fn handle_key(ui: &mut Ui, key: KeyEvent) {
         KeyCode::Char('6') | KeyCode::Char('w') if ui.tab != Tab::Services => {
             ui.tab = Tab::Switches
         }
+        KeyCode::Char('i') => cycle_advertise(ui),
         _ => match ui.tab {
             Tab::Dashboard => {}
             Tab::Services => handle_services_key(ui, key),
@@ -518,6 +519,66 @@ fn on_tab_changed(ui: &mut Ui) {
         let root = ui.app.config.read().unwrap().root.clone();
         ui.files.refresh(&root);
     }
+}
+
+/// Step through the local addresses that can be advertised: automatic first,
+/// then one entry per interface. The choice is saved, so a machine on cable
+/// and Wi-Fi keeps handing out the same address after a restart.
+fn cycle_advertise(ui: &mut Ui) {
+    let list = crate::netif::candidates();
+    if list.is_empty() {
+        ui.status_msg = Some("no usable network interface".into());
+        return;
+    }
+    let chosen = {
+        let mut cfg = ui.app.config.write().unwrap();
+        // 0 = automatic, 1..=n = the interfaces.
+        let current = match &cfg.advertise {
+            None => 0,
+            Some(name) => list
+                .iter()
+                .position(|i| &i.name == name || i.ip.to_string() == *name)
+                .map(|p| p + 1)
+                .unwrap_or(0),
+        };
+        let next = (current + 1) % (list.len() + 1);
+        cfg.advertise = if next == 0 { None } else { Some(list[next - 1].name.clone()) };
+        cfg.advertise.clone()
+    };
+    save_config(ui);
+    ui.beep(Tone::Confirm);
+    ui.status_msg = Some(match chosen {
+        Some(name) => {
+            let ip = crate::netif::resolve_advertise(&name)
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "?".into());
+            format!("URLs now use {name} ({ip})")
+        }
+        None => {
+            let ip = crate::netif::suggest_ip()
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "?".into());
+            format!("URLs use the automatic choice ({ip})")
+        }
+    });
+}
+
+/// The address generated URLs currently use, and where it came from.
+pub fn advertised_now(ui: &Ui) -> (Option<std::net::IpAddr>, String) {
+    let cfg = ui.app.config.read().unwrap();
+    let ip = cfg.advertised_ip("0.0.0.0", None);
+    let source = match (&cfg.advertise, ip) {
+        (Some(pin), Some(ip)) => match crate::netif::resolve_advertise(pin) {
+            Some(_) => format!("{} pinned", crate::netif::interface_of(&ip).unwrap_or_else(|| pin.clone())),
+            None => format!("{pin} is gone — using automatic"),
+        },
+        (None, Some(ip)) => format!(
+            "{} automatic",
+            crate::netif::interface_of(&ip).unwrap_or_else(|| "?".into())
+        ),
+        (_, None) => "no address".into(),
+    };
+    (ip, source)
 }
 
 fn selected_service(ui: &Ui) -> ServiceId {
@@ -733,7 +794,8 @@ fn open_cisco_modal(ui: &mut Ui, name: &str) {
         format!("{}/{}", ui.files.cwd, name)
     };
     let cfg = ui.app.config.read().unwrap();
-    let ip = crate::netif::suggest_ip()
+    let ip = cfg
+        .advertised_ip("0.0.0.0", None)
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let mut commands = crate::cisco::commands_for_file(&cfg, &ip, &rel);
     if commands.is_empty() {
@@ -870,7 +932,8 @@ pub fn deploy_command_for(ui: &Ui, form: &DeployForm, rel: &str) -> Result<Strin
     let id = crate::cisco::service_of(form.proto);
     let cfg = ui.app.config.read().unwrap();
     let peer: Option<std::net::IpAddr> = form.host.trim().parse().ok();
-    let ip = crate::netif::advertised_ip(&cfg.service(id).bind, peer.as_ref())
+    let ip = cfg
+        .advertised_ip(&cfg.service(id).bind, peer.as_ref())
         .ok_or_else(|| "no local IP address to advertise to the switch".to_string())?;
     crate::cisco::deploy_command(form.proto, &cfg, &ip, rel, &form.dest)
 }
@@ -1317,6 +1380,22 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
                     }
                 }
                 ui.modal = modal;
+                return;
+            }
+            KeyCode::Char('i') => {
+                let rel = match &modal {
+                    Some(Modal::Cisco { rel_path, .. }) => rel_path.clone(),
+                    _ => String::new(),
+                };
+                cycle_advertise(ui);
+                // Rebuild with the new address; the file is unchanged.
+                let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+                let keep_cwd = std::mem::replace(
+                    &mut ui.files.cwd,
+                    rel.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default(),
+                );
+                open_cisco_modal(ui, &name);
+                ui.files.cwd = keep_cwd;
                 return;
             }
             KeyCode::Esc | KeyCode::Char('q') => {}
