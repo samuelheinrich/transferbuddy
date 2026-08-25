@@ -3,6 +3,7 @@ mod certs;
 mod cisco;
 mod cli;
 mod config;
+mod deploy;
 mod fsroot;
 mod logging;
 mod netif;
@@ -38,6 +39,9 @@ pub struct App {
     pub sessions: Arc<SessionManager>,
     pub services: ServiceManager,
     pub privileged: bool,
+    /// Handle of the async runtime, so the (synchronous) TUI can spawn work
+    /// such as a deploy session.
+    pub runtime: tokio::runtime::Handle,
 }
 
 pub type SharedApp = Arc<App>;
@@ -81,6 +85,7 @@ fn main() -> ExitCode {
         sessions: sessions.clone(),
         services,
         privileged,
+        runtime: runtime.handle().clone(),
     });
     app.services.attach_app(&app);
     sessions.start_metrics_task(runtime.handle());

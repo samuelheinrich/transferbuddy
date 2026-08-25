@@ -122,6 +122,34 @@ pub fn effective_ip(bind: &str) -> Option<IpAddr> {
     }
 }
 
+/// The local address the kernel would use to reach `peer`, asked by opening
+/// an unconnected UDP socket — no packet is sent. This is what a device on
+/// another subnet must be told to fetch from, and it is more reliable than
+/// guessing from the interface list on a multi-homed machine.
+pub fn source_ip_for(peer: &IpAddr) -> Option<IpAddr> {
+    let bind = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let sock = std::net::UdpSocket::bind(bind).ok()?;
+    // Port 9 (discard); connect() on UDP only sets the default peer.
+    sock.connect(std::net::SocketAddr::new(*peer, 9)).ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_unspecified() {
+        return None;
+    }
+    Some(ip)
+}
+
+/// Address a device at `peer` should use for a service bound to `bind`:
+/// an explicit bind address wins, otherwise the route towards the device
+/// decides, and only then the generic suggestion.
+pub fn advertised_ip(bind: &str, peer: Option<&IpAddr>) -> Option<IpAddr> {
+    if let Ok(ip) = bind.parse::<IpAddr>() {
+        if !ip.is_unspecified() {
+            return Some(ip);
+        }
+    }
+    peer.and_then(source_ip_for).or_else(suggest_ip)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +178,18 @@ mod tests {
     #[test]
     fn effective_ip_uses_bind_when_concrete() {
         assert_eq!(effective_ip("192.168.1.10"), Some(v4("192.168.1.10")));
+    }
+
+    #[test]
+    fn advertised_ip_prefers_an_explicit_bind() {
+        let peer = v4("10.1.2.3");
+        assert_eq!(advertised_ip("192.168.1.10", Some(&peer)), Some(v4("192.168.1.10")));
+        // A wildcard bind falls through to the route towards the peer.
+        assert_ne!(advertised_ip("0.0.0.0", Some(&peer)), Some(v4("0.0.0.0")));
+    }
+
+    #[test]
+    fn source_ip_towards_loopback_is_loopback() {
+        assert_eq!(source_ip_for(&v4("127.0.0.1")), Some(v4("127.0.0.1")));
     }
 }

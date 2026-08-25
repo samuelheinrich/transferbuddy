@@ -23,39 +23,77 @@ fn fmt_ip(ip: &IpAddr) -> String {
     }
 }
 
-/// Build the `copy <url> flash:` command for one file and one protocol.
-/// `rel_path` is the file path relative to the shared root, `/`-separated.
-pub fn copy_command(proto: Protocol, cfg: &Config, ip: &IpAddr, rel_path: &str) -> String {
+/// The service that carries one protocol.
+pub fn service_of(proto: Protocol) -> ServiceId {
+    match proto {
+        Protocol::Ftp => ServiceId::Ftp,
+        Protocol::Http => ServiceId::Http,
+        Protocol::Https => ServiceId::Https,
+        Protocol::Scp | Protocol::Sftp => ServiceId::Ssh,
+        Protocol::Tftp => ServiceId::Tftp,
+    }
+}
+
+/// The source URL a device uses to fetch `rel_path` from transferbuddy.
+/// `needs_port` reports whether the port had to be spelled out.
+fn source_url(proto: Protocol, cfg: &Config, ip: &IpAddr, rel_path: &str) -> (String, bool) {
     let host = fmt_ip(ip);
     let user = &cfg.auth.username;
     let pass = &cfg.auth.password;
     let rel = rel_path.trim_start_matches('/');
-    let (port, needs_port) = {
-        let sc = cfg.service(match proto {
-            Protocol::Ftp => ServiceId::Ftp,
-            Protocol::Http => ServiceId::Http,
-            Protocol::Https => ServiceId::Https,
-            Protocol::Scp | Protocol::Sftp => ServiceId::Ssh,
-            Protocol::Tftp => ServiceId::Tftp,
-        });
-        (sc.port, sc.port != cisco_default_port(proto))
+    let sc = cfg.service(service_of(proto));
+    let needs_port = sc.port != cisco_default_port(proto);
+    let port_part = if needs_port { format!(":{}", sc.port) } else { String::new() };
+    let url = match proto {
+        Protocol::Http => format!("http://{host}{port_part}/{rel}"),
+        Protocol::Https => format!("https://{host}{port_part}/{rel}"),
+        Protocol::Ftp => format!("ftp://{user}:{pass}@{host}{port_part}/{rel}"),
+        Protocol::Scp => format!("scp://{user}@{host}{port_part}/{rel}"),
+        Protocol::Sftp => format!("sftp://{user}@{host}{port_part}/{rel}"),
+        // IOS `copy tftp://` does not accept a port at all.
+        Protocol::Tftp => format!("tftp://{host}/{rel}"),
     };
-    let port_part = if needs_port { format!(":{port}") } else { String::new() };
-    match proto {
-        Protocol::Http => format!("copy http://{host}{port_part}/{rel} flash:"),
-        Protocol::Https => format!("copy https://{host}{port_part}/{rel} flash:"),
-        Protocol::Ftp => format!("copy ftp://{user}:{pass}@{host}{port_part}/{rel} flash:"),
-        Protocol::Scp => format!("copy scp://{user}@{host}{port_part}/{rel} flash:"),
-        Protocol::Sftp => format!("copy sftp://{user}@{host}{port_part}/{rel} flash:"),
-        Protocol::Tftp => {
-            // IOS `copy tftp://` does not accept a port; non-69 needs a hint.
-            if needs_port {
-                format!("copy tftp://{host}/{rel} flash:   ! note: TFTP runs on port {port}; IOS only supports port 69 — run with sudo for port 69")
-            } else {
-                format!("copy tftp://{host}/{rel} flash:")
-            }
-        }
+    (url, needs_port)
+}
+
+/// Build the `copy <url> flash:` command for one file and one protocol.
+/// `rel_path` is the file path relative to the shared root, `/`-separated.
+pub fn copy_command(proto: Protocol, cfg: &Config, ip: &IpAddr, rel_path: &str) -> String {
+    let (url, needs_port) = source_url(proto, cfg, ip, rel_path);
+    if proto == Protocol::Tftp && needs_port {
+        // IOS only ever talks to port 69, so the command alone is not enough.
+        let port = cfg.service(ServiceId::Tftp).port;
+        return format!(
+            "copy {url} flash:   ! note: TFTP runs on port {port}; IOS only supports port 69 — run with sudo for port 69"
+        );
     }
+    format!("copy {url} flash:")
+}
+
+/// The command a deploy types on the device: no explanatory suffix, and an
+/// explicit destination. `Err` when the device could not reach the service.
+pub fn deploy_command(
+    proto: Protocol,
+    cfg: &Config,
+    ip: &IpAddr,
+    rel_path: &str,
+    dest: &str,
+) -> Result<String, String> {
+    let dest = dest.trim();
+    if dest.is_empty() {
+        return Err("destination is empty — use e.g. flash:".into());
+    }
+    let (url, needs_port) = source_url(proto, cfg, ip, rel_path);
+    if proto == Protocol::Tftp && needs_port {
+        return Err(format!(
+            "IOS only supports TFTP on port 69, transferbuddy listens on {} — \
+             start transferbuddy with sudo or deploy over HTTP",
+            cfg.service(ServiceId::Tftp).port
+        ));
+    }
+    let cmd = format!("copy {url} {dest}");
+    crate::deploy::check_command(&cmd)?;
+    Ok(cmd)
 }
 
 /// All copy commands for the currently enabled services.
@@ -151,6 +189,34 @@ mod tests {
         let cmds = commands_for_file(&c, &ip(), "a.bin");
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].0, Protocol::Http);
+    }
+
+    #[test]
+    fn deploy_command_is_a_bare_copy() {
+        let c = cfg(false);
+        assert_eq!(
+            deploy_command(Protocol::Http, &c, &ip(), "img.bin", "flash:").unwrap(),
+            "copy http://192.168.1.10:8080/img.bin flash:"
+        );
+        assert_eq!(
+            deploy_command(Protocol::Http, &c, &ip(), "sub/img.bin", "bootflash:new.bin").unwrap(),
+            "copy http://192.168.1.10:8080/sub/img.bin bootflash:new.bin"
+        );
+        // No trailing "! note:" comment — this is typed on the device.
+        assert!(!deploy_command(Protocol::Http, &c, &ip(), "img.bin", "flash:")
+            .unwrap()
+            .contains('!'));
+    }
+
+    #[test]
+    fn deploy_command_rejects_what_the_device_cannot_do() {
+        let c = cfg(false);
+        // TFTP on a high port is unreachable for IOS.
+        assert!(deploy_command(Protocol::Tftp, &c, &ip(), "img.bin", "flash:").is_err());
+        assert!(deploy_command(Protocol::Tftp, &cfg(true), &ip(), "img.bin", "flash:").is_ok());
+        // And the whitelist still applies to the destination.
+        assert!(deploy_command(Protocol::Http, &c, &ip(), "img.bin", "running-config").is_err());
+        assert!(deploy_command(Protocol::Http, &c, &ip(), "img.bin", "").is_err());
     }
 
     #[test]

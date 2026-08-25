@@ -23,6 +23,9 @@ copy with a single keypress.
   shared directory, each individually startable.
 - **Ready-to-paste Cisco commands** for every enabled protocol, with the right
   IP, port and credentials — one keypress to the clipboard.
+- **Deploy from the file browser:** `d` opens an SSH session to the switch and
+  runs the `copy` for you — and nothing else. transferbuddy can type four kinds
+  of line on a device and a configuration command is not one of them.
 - **Live session view:** progress, current and average speed, ETA, per-protocol
   counters.
 - **Fixed, known credentials** (`cisco` / `cisco123`) — nothing random to look
@@ -194,6 +197,74 @@ enabled protocol — with the detected local IP, the configured port and the
 credentials already filled in. `y` copies the selected line to the clipboard.
 
 ![transferbuddy Cisco copy commands](docs/screenshots/cisco-copy.svg)
+
+`d` goes one step further and does it for you — see [Deploy](#deploy).
+
+#### Deploy
+
+Pressing `d` on a file opens an SSH session to a switch and starts the transfer
+from the device side — no console, no copy-paste:
+
+```
+ switch IP / host  10.20.30.40
+ ssh port          22
+ username          netadmin
+ password          •••••••
+ enable password   ••••••
+ protocol          http  (running)
+ destination       flash:
+ overwrite         no
+
+ the switch will run  copy http://10.20.30.9:8080/cat9k_iosxe.17.09.bin flash:
+```
+
+`↑↓` moves between fields, `←→`/`Space` cycles the protocol and toggles
+`overwrite`, `Enter` starts. The line above the keys is the exact command that
+will be typed — the source address is the local IP that actually routes to the
+switch, so a multi-homed machine advertises the right one.
+
+From there the popup turns into a live transcript: what transferbuddy sent
+(`>`), what the device answered, and the `!!!!` progress marks of the running
+`copy`. `c` cancels, `↑↓` scrolls, `r` returns to the form for the next file.
+The transfer also shows up in the sessions view like any other download,
+because that is what it is.
+
+**What transferbuddy is allowed to do on your switch**
+
+The whole point of the feature is that it stays inside a very small box. Every
+line that goes to a device passes a whitelist, and the whitelist has four
+entries:
+
+| Line | Why |
+|------|-----|
+| `terminal length 0` | otherwise the output stops at `--More--` |
+| `enable` | `copy` needs privileged EXEC — skipped when the login is already at `#` |
+| `copy <transferbuddy URL> <device>:` | the actual transfer |
+| `exit` | leave the session cleanly |
+
+Everything else is refused before a byte is sent: `configure terminal`,
+`write`, `reload`, `delete`, `erase`, `format`, a `copy` into `running-config`
+or `startup-config`, a second command chained with `;` or `|`. The copy
+destination must be a storage device (`flash:`, `bootflash:`, `usbflash0:`,
+`disk0:`, …).
+
+The prompts `copy` asks are answered just as narrowly. `Destination filename`,
+`Source filename` and `Address or name of remote host` are confirmed with
+Enter; `Do you want to over write?` follows the `overwrite` setting; anything
+about erasing or formatting is always declined; and a prompt transferbuddy does
+not recognise ends the session instead of being confirmed blindly. The only
+answers it can send are Enter and `n`.
+
+Passwords are typed only at a `Password:` prompt, are shown as `••••` in the
+form, as `********` in the transcript and never reach the log or `config.toml`.
+They are cleared after every run — host, user, protocol and destination are
+kept so the next file takes two keystrokes.
+
+On the first connection the device's host key is shown as a SHA-256
+fingerprint and, once accepted with `y`, stored in
+`~/Library/Application Support/transferbuddy/state/known_hosts`. If a stored
+key later no longer matches, the deploy fails and says which line to remove —
+it is never silently accepted.
 
 ### 4 · Sessions
 
@@ -380,12 +451,14 @@ intro         = true   # animated intro screen on start
 | `S` / `X` | start all enabled / stop all |
 | `p` / `b` | change port / bind address |
 | `n` / `w` | set username / password |
-| `u` / `d` | toggle uploads / set upload directory |
+| `u` / `d` | toggle uploads / set upload directory (Services) |
+| `d` | deploy the selected file to a switch over SSH (Files) |
 | `/` | filter (files, logs) |
 | `y` | copy the shown Cisco command to the clipboard |
 | `B` | toggle bit/s ↔ byte/s (Sessions) |
 | `G` | follow log tail |
 | `H` | file hashes (MD5/SHA-256/SHA-512) with compare |
+| `c` | cancel a running deploy (Deploy) |
 | `L` | log level (Logs) · logs of the selected service (Services) |
 | `P` | protocol filter (Logs) |
 
@@ -427,6 +500,9 @@ use) · `2` invalid configuration/arguments.
 | `copy https:` fails on the device | the self-signed certificate isn't trusted; install it as a trustpoint or use HTTP |
 | SCP/SFTP host key error on device | the host key changed; clear the old known-host entry on the device |
 | Upload rejected | uploads are disabled by default (`--uploads`), files are never overwritten, size limit may apply |
+| Deploy says "… is not running" | the deploy only uses services you started — press `s` on the protocol in the services view |
+| Deploy stops at "unexpected prompt" | the device asked something transferbuddy will not answer on its own; the transcript shows the question. Run that `copy` by hand |
+| Deploy fails with "host key … changed" | remove the named line from `state/known_hosts` if the device really was replaced |
 | Wrong directory shared | the root always follows the working directory — check the dashboard's `root:` line, and `--root` if you passed it. Older builds pinned the root in `config.toml`; the stale `root =` key is now ignored, so re-installing is enough |
 
 ## Development
@@ -444,6 +520,7 @@ src/
 ├── main.rs        # startup, headless mode
 ├── cli.rs         # clap argument parser
 ├── config.rs      # config.toml model, CLI merge, validation
+├── deploy.rs      # SSH client to the switch + the command whitelist
 ├── fsroot.rs      # SecureRoot: path traversal & symlink jail
 ├── session.rs     # SessionManager: live transfer metrics
 ├── services/      # ServiceManager + one adapter per protocol

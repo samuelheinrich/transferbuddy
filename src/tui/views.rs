@@ -6,7 +6,7 @@ use crate::logging::LogLevel;
 use crate::services::{ServiceId, ServiceStatus};
 use crate::session::{fmt_bytes, fmt_duration, fmt_speed, SessionState};
 
-use super::{theme, EditField, Modal, Tab, Ui};
+use super::{theme, DeployField, DeployPhase, DeployView, EditField, Modal, Tab, Ui};
 
 pub fn draw(f: &mut Frame, ui: &mut Ui) {
     // Paint the retro background first; every panel keeps it.
@@ -94,6 +94,7 @@ fn footer_keys(tab: Tab) -> Vec<(&'static str, &'static str)> {
         Tab::Files => vec![
             ("Enter", "open"),
             ("Bksp", "up"),
+            ("d", "deploy"),
             ("H", "hashes"),
             ("s", "sort"),
             ("/", "filter"),
@@ -832,12 +833,17 @@ const HELP_LEFT: &[(&str, KeyRows)] = &[
             ("↑ ↓", "select entry"),
             ("Enter", "open dir / cisco cmds"),
             ("Bksp", "parent directory"),
+            ("d", "deploy to a switch"),
             ("y", "copy cisco command"),
             ("H", "hashes + compare"),
             ("s", "cycle sort order"),
             ("/", "filter by name"),
             ("R", "refresh listing"),
         ],
+    ),
+    (
+        "SESSIONS (4)",
+        &[("↑ ↓", "select session"), ("B", "bit/s ⇄ byte/s")],
     ),
 ];
 
@@ -860,8 +866,14 @@ const HELP_RIGHT: &[(&str, KeyRows)] = &[
         ],
     ),
     (
-        "SESSIONS (4)",
-        &[("↑ ↓", "select session"), ("B", "bit/s ⇄ byte/s")],
+        "DEPLOY (d in files)",
+        &[
+            ("↑ ↓", "form field"),
+            ("← →", "protocol / toggle"),
+            ("Enter", "start the copy"),
+            ("c", "cancel a running copy"),
+            ("r", "back to the form"),
+        ],
     ),
     (
         "LOGS (5)",
@@ -947,6 +959,226 @@ fn draw_help(f: &mut Frame, help_scroll: usize) {
         .alignment(Alignment::Center),
         Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
     );
+}
+
+/// The deploy popup: the form before the run, the live SSH transcript during
+/// and after it.
+fn draw_deploy(f: &mut Frame, ui: &Ui) {
+    let Some(view) = &ui.deploy else { return };
+    let width = f.area().width.min(112);
+    let height = f.area().height.saturating_sub(2).min(match view.phase {
+        // Fields, the command preview, an optional error and the two hints.
+        DeployPhase::Form => DeployField::ALL.len() as u16 + 9,
+        DeployPhase::HostKey { .. } => 11,
+        _ => 34,
+    });
+    let area = centered_rect(width, height, f.area());
+    f.render_widget(Clear, area);
+    let title = format!(" DEPLOY  /{} ", view.rel_path);
+    let block = theme::panel_double(&title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    match &view.phase {
+        DeployPhase::Form => draw_deploy_form(f, ui, view, inner),
+        DeployPhase::HostKey { fingerprint } => draw_deploy_host_key(f, view, fingerprint, inner),
+        _ => draw_deploy_session(f, view, inner),
+    }
+}
+
+fn draw_deploy_form(f: &mut Frame, ui: &Ui, view: &DeployView, area: Rect) {
+    let cfg = ui.app.config.read().unwrap();
+    let mut lines = Vec::new();
+    for (i, field) in DeployField::ALL.iter().enumerate() {
+        let value = match field {
+            DeployField::Host => view.form.host.clone(),
+            DeployField::Port => view.form.port.clone(),
+            DeployField::Username => view.form.username.clone(),
+            DeployField::Password => "•".repeat(view.form.password.chars().count()),
+            DeployField::EnablePassword => {
+                "•".repeat(view.form.enable_password.chars().count())
+            }
+            DeployField::Destination => view.form.dest.clone(),
+            DeployField::Overwrite => {
+                if view.form.overwrite { "yes".into() } else { "no".into() }
+            }
+            DeployField::Protocol => {
+                let id = crate::cisco::service_of(view.form.proto);
+                let status = ui.app.services.status(id);
+                format!(
+                    "{}  ({})",
+                    view.form.proto.label(),
+                    if status.is_running() {
+                        "running".to_string()
+                    } else if cfg.service(id).enabled {
+                        "enabled, not started".to_string()
+                    } else {
+                        "off".to_string()
+                    }
+                )
+            }
+        };
+        let selected = i == view.form.field;
+        let shown = if selected && field.is_text() {
+            format!("{value}█")
+        } else {
+            value
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<18}", field.label()),
+                Style::default().fg(theme::ACCENT),
+            ),
+            Span::styled(
+                shown,
+                if selected { theme::selected_strong() } else { Style::default().fg(theme::TEXT) },
+            ),
+        ]));
+    }
+    drop(cfg);
+
+    lines.push(Line::from(""));
+    match super::deploy_command_for(ui, &view.form, &view.rel_path) {
+        Ok(cmd) => lines.push(Line::from(vec![
+            theme::label(" the switch will run  "),
+            Span::styled(cmd, Style::default().fg(theme::CYAN).bold()),
+        ])),
+        Err(e) => lines.push(Line::from(Span::styled(
+            format!(" {e}"),
+            Style::default().fg(theme::WARN),
+        ))),
+    }
+    if let Some(err) = &view.error {
+        lines.push(Line::from(Span::styled(
+            format!(" {err}"),
+            Style::default().fg(theme::ERR).bold(),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        theme::key("↑↓"),
+        theme::label(" field  "),
+        theme::key("←→/Space"),
+        theme::label(" protocol, overwrite  "),
+        theme::key("Enter"),
+        theme::label(" deploy  "),
+        theme::key("Esc"),
+        theme::label(" close"),
+    ]));
+    lines.push(Line::from(theme::label(
+        " transferbuddy logs in, runs exactly this one copy and leaves — never a config command.",
+    )));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn draw_deploy_host_key(f: &mut Frame, view: &DeployView, fingerprint: &str, area: Rect) {
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " First connection to this switch — unknown host key:",
+            Style::default().fg(theme::WARN).bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            theme::label("   host         "),
+            theme::value(view.form.host.clone()),
+        ]),
+        Line::from(vec![
+            theme::label("   fingerprint  "),
+            Span::styled(fingerprint.to_string(), Style::default().fg(theme::CYAN).bold()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            theme::key("y"),
+            theme::label(" trust and remember it      "),
+            theme::key("any other key"),
+            theme::label(" abort"),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn draw_deploy_session(f: &mut Frame, view: &DeployView, area: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(3),
+        Constraint::Length(2),
+    ])
+    .split(area);
+
+    let (state_text, state_color) = match &view.phase {
+        DeployPhase::Done(Ok(summary)) => (format!("✓ {summary}"), theme::OK),
+        DeployPhase::Done(Err(e)) => (format!("✗ {e}"), theme::ERR),
+        _ => (view.stage.clone(), theme::HILITE),
+    };
+    let mut head = vec![Line::from(vec![
+        theme::label(" switch  "),
+        theme::value(format!("{}:{}", view.form.host, view.form.port)),
+        theme::label("   command  "),
+        Span::styled(
+            view.command.clone().unwrap_or_default(),
+            Style::default().fg(theme::CYAN),
+        ),
+    ])];
+    head.push(Line::from(Span::styled(
+        format!(" {state_text}"),
+        Style::default().fg(state_color).bold(),
+    )));
+    f.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), chunks[0]);
+
+    // Transcript, tail-following unless the user scrolled up.
+    let rows = chunks[1].height as usize;
+    let mut body: Vec<&str> = view.transcript.iter().map(String::as_str).collect();
+    if !view.live.is_empty() {
+        body.push(view.live.as_str());
+    }
+    let start = match view.scroll {
+        Some(s) => s.min(body.len().saturating_sub(1)),
+        None => body.len().saturating_sub(rows),
+    };
+    let lines: Vec<Line> = body[start..]
+        .iter()
+        .take(rows)
+        .map(|l| {
+            let style = if let Some(rest) = l.strip_prefix("> ") {
+                let _ = rest;
+                Style::default().fg(theme::ACCENT).bold()
+            } else if l.starts_with('%') {
+                Style::default().fg(theme::ERR)
+            } else {
+                Style::default().fg(theme::TEXT)
+            };
+            Line::from(Span::styled(format!(" {l}"), style))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines).block(theme::panel(" SESSION ")),
+        chunks[1],
+    );
+
+    let hint = match &view.phase {
+        DeployPhase::Done(_) => vec![
+            Span::raw(" "),
+            theme::key("r"),
+            theme::label(" deploy again   "),
+            theme::key("↑↓"),
+            theme::label(" scroll   "),
+            theme::key("Esc"),
+            theme::label(" close"),
+        ],
+        _ => vec![
+            Span::raw(" "),
+            theme::key("c"),
+            theme::label(" cancel   "),
+            theme::key("↑↓"),
+            theme::label(" scroll   "),
+            theme::key("G"),
+            theme::label(" follow"),
+        ],
+    };
+    f.render_widget(Paragraph::new(Line::from(hint)), chunks[2]);
 }
 
 fn draw_modal(f: &mut Frame, ui: &Ui) {
@@ -1117,6 +1349,7 @@ fn draw_modal(f: &mut Frame, ui: &Ui) {
                 area,
             );
         }
+        Modal::Deploy => draw_deploy(f, ui),
         Modal::Hashes => {
             let mut lines = Vec::new();
             if let Some(info) = &ui.hashes {
@@ -1198,6 +1431,7 @@ mod tests {
             sessions,
             services,
             privileged: false,
+            runtime: rt.handle().clone(),
         });
         (rt, app)
     }
@@ -1219,6 +1453,7 @@ mod tests {
             status_msg: None,
             hashes: None,
             help_scroll: 0,
+            deploy: None,
         }
     }
 
@@ -1276,6 +1511,55 @@ mod tests {
             let screen = render_ui(&mut ui);
             assert!(screen.contains('╔'), "modal without a frame");
         }
+    }
+
+    #[test]
+    fn deploy_modal_renders_every_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("image.bin"), b"x").unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        ui.tab = Tab::Files;
+        ui.modal = Some(Modal::Deploy);
+
+        let mut form = super::super::DeployForm::default();
+        form.host = "10.20.30.40".into();
+        form.username = "netadmin".into();
+        form.password = "letmein".into();
+        ui.deploy = Some(super::super::DeployView::for_test("image.bin", form));
+
+        // The form shows every field, the resulting command and the promise
+        // that nothing else is run.
+        let screen = render_ui(&mut ui);
+        for label in DeployField::ALL.iter().map(|f| f.label()) {
+            assert!(screen.contains(label), "form is missing {label}");
+        }
+        assert!(screen.contains("copy http://"), "no command preview");
+        assert!(screen.contains("never a config"), "missing the safety note");
+        // Passwords are masked.
+        assert!(!screen.contains("letmein"), "password shown in clear");
+
+        // Host key confirmation.
+        let view = ui.deploy.as_mut().unwrap();
+        view.phase = DeployPhase::HostKey { fingerprint: "SHA256:abc123".into() };
+        let screen = render_ui(&mut ui);
+        assert!(screen.contains("SHA256:abc123"), "no fingerprint");
+
+        // Running session with a transcript.
+        let view = ui.deploy.as_mut().unwrap();
+        view.phase = DeployPhase::Running;
+        view.stage = "copying".into();
+        view.command = Some("copy http://10.0.0.1/image.bin flash:".into());
+        view.transcript = vec!["> terminal length 0".into(), "cat9k-1#".into()];
+        view.live = "!!!!!!".into();
+        let screen = render_ui(&mut ui);
+        assert!(screen.contains("copying") && screen.contains("!!!!!!"), "{screen}");
+
+        // Result.
+        let view = ui.deploy.as_mut().unwrap();
+        view.phase = DeployPhase::Done(Ok("521510912 bytes copied in 231.402 secs".into()));
+        let screen = render_ui(&mut ui);
+        assert!(screen.contains("bytes copied in"), "no summary");
     }
 
     #[test]
@@ -1343,7 +1627,7 @@ mod tests {
         assert!(!short.contains("protocol filter"));
         assert!(short.contains("scroll"));
         // ... and scrolling brings them in.
-        let scrolled = render_help(120, 20, 12).join("\n");
+        let scrolled = render_help(120, 20, 14).join("\n");
         assert!(scrolled.contains("protocol filter"));
     }
 
