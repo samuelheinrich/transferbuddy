@@ -32,6 +32,8 @@ const COPY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const TRANSCRIPT_MAX: usize = 2000;
 /// How often the ping monitor checks a device.
 const PING_INTERVAL: Duration = Duration::from_secs(5);
+/// How long an unanswered host key question keeps a session waiting.
+const HOST_KEY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Everything needed to open a session.
 #[derive(Debug, Clone)]
@@ -182,6 +184,10 @@ impl Switch {
     pub fn last_result(&self) -> Option<std::result::Result<String, String>> {
         self.last_result.lock().unwrap().clone()
     }
+    /// Whether an abort was requested. Used by the UI tests.
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
     pub fn jobs_done(&self) -> u64 {
         self.jobs_done.load(Ordering::Relaxed)
     }
@@ -204,10 +210,14 @@ impl Switch {
         self.jobs.send(job).is_ok()
     }
 
-    /// Abort whatever is running. A `copy` cannot be taken back on the device
-    /// side, so this tears the session down instead of pretending otherwise.
+    /// Abort whatever is running or being waited for. A `copy` cannot be taken
+    /// back on the device side, so this tears the session down instead of
+    /// pretending otherwise. Safe to call in any state, including while the
+    /// connection is still being set up or a host key question is open.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+        // A pending host key question would otherwise keep the driver parked.
+        self.answer_host_key(false);
     }
 
     /// Answer the pending host key question.
@@ -215,6 +225,21 @@ impl Switch {
         if let Some(tx) = self.host_key_reply.lock().unwrap().take() {
             let _ = tx.send(accept);
         }
+    }
+
+    /// A detached session with an open host key question, plus the receiver
+    /// the answer arrives on.
+    #[cfg(test)]
+    pub fn for_test_host_key(fingerprint: &str) -> (Arc<Self>, oneshot::Receiver<bool>) {
+        let switch = Self::for_test(
+            "10.20.30.40",
+            SwitchState::HostKey { fingerprint: fingerprint.to_string() },
+            Facts::default(),
+            Vec::new(),
+        );
+        let (tx, rx) = oneshot::channel();
+        *switch.host_key_reply.lock().unwrap() = Some(tx);
+        (switch, rx)
     }
 
     /// A detached session with a fixed state, for rendering tests.
@@ -366,7 +391,13 @@ async fn drive(
     };
 
     switch.push(LineKind::Info, format!("connecting to {}:{}", target.host, target.port));
-    let mut shell = match open_shell(&switch, &target).await {
+    // Connecting must stay abortable: a device that never answers, or a host
+    // key question nobody wants to answer, must not park the session forever.
+    let opened = tokio::select! {
+        result = open_shell(&switch, &target) => result,
+        _ = cancelled(&switch) => Err(anyhow!("cancelled before the session was up")),
+    };
+    let mut shell = match opened {
         Ok(shell) => shell,
         Err(e) => {
             let reason = format!("{e:#}");
@@ -445,6 +476,13 @@ async fn drive(
         switch.set_state(SwitchState::Ready);
     }
     switch.set_state(SwitchState::Closed);
+}
+
+/// Resolves once the session has been asked to stop.
+async fn cancelled(switch: &Arc<Switch>) {
+    while !switch.cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn run_job(switch: &Arc<Switch>, shell: &mut Shell, job: &Job) -> Result<String> {
@@ -668,9 +706,20 @@ impl client::Handler for ClientHandler {
         *self.switch.host_key_reply.lock().unwrap() = Some(tx);
         self.switch
             .set_state(SwitchState::HostKey { fingerprint: fingerprint.clone() });
-        if !rx.await.unwrap_or(false) {
-            bail!("host key rejected");
+        let answer = tokio::time::timeout(HOST_KEY_TIMEOUT, rx).await;
+        // Take the sender back so a late answer cannot resolve a dead wait.
+        self.switch.host_key_reply.lock().unwrap().take();
+        match answer {
+            Ok(Ok(true)) => {}
+            Ok(_) => bail!("host key rejected"),
+            Err(_) => bail!(
+                "no answer to the host key question within {} minutes",
+                HOST_KEY_TIMEOUT.as_secs() / 60
+            ),
         }
+        // Back to connecting, or the question stays on screen and every
+        // further key press reads as another answer to it.
+        self.switch.set_state(SwitchState::Connecting);
         russh_keys::known_hosts::learn_known_hosts_path(
             &self.switch.host,
             self.switch.port,
@@ -876,9 +925,11 @@ async fn open_shell(switch: &Arc<Switch>, target: &Target) -> Result<Shell> {
         ),
     }
 
+    switch.push(LineKind::Info, format!("authenticating as {}", target.username));
     let channel = session.channel_open_session().await?;
     channel.request_pty(true, "vt100", 200, 48, 0, 0, &[]).await?;
     channel.request_shell(true).await?;
+    switch.push(LineKind::Info, "waiting for the device prompt");
 
     let mut shell = Shell {
         channel,
@@ -1058,6 +1109,9 @@ mod tests {
         pub struct Device {
             log: Arc<Mutex<Transcript>>,
             enable_password: String,
+            /// Delay before the first prompt, to make the window between
+            /// "host key accepted" and "session ready" observable.
+            greet_delay: std::time::Duration,
             line: String,
             enabled: bool,
             expect_enable_password: bool,
@@ -1178,6 +1232,9 @@ mod tests {
                 session: &mut Session,
             ) -> Result<(), Self::Error> {
                 session.channel_success(id);
+                if !self.greet_delay.is_zero() {
+                    tokio::time::sleep(self.greet_delay).await;
+                }
                 self.say(session, id, "\r\ncat9k-1>");
                 Ok(())
             }
@@ -1203,6 +1260,15 @@ mod tests {
 
         /// Start the fake device on a loopback port and return the port.
         pub async fn spawn(log: Arc<Mutex<Transcript>>, enable_password: &str) -> u16 {
+            spawn_with_delay(log, enable_password, std::time::Duration::ZERO).await
+        }
+
+        /// Same, but slow to greet — see [`Device::greet_delay`].
+        pub async fn spawn_with_delay(
+            log: Arc<Mutex<Transcript>>,
+            enable_password: &str,
+            greet_delay: std::time::Duration,
+        ) -> u16 {
             let config = Arc::new(russh::server::Config {
                 methods: MethodSet::PASSWORD,
                 keys: vec![russh_keys::key::KeyPair::generate_ed25519()],
@@ -1216,6 +1282,7 @@ mod tests {
                     let handler = Device {
                         log: log.clone(),
                         enable_password: enable_password.clone(),
+                        greet_delay,
                         line: String::new(),
                         enabled: false,
                         expect_enable_password: false,
@@ -1266,6 +1333,19 @@ mod tests {
         })
         .await;
         sw.answer_host_key(true);
+        // Accepting must clear the question right away. Leaving the state on
+        // `HostKey` while the handshake finishes freezes the popup on the
+        // question, and every further key press reads as another answer.
+        wait_for("the key to be stored", || {
+            sw.transcript()
+                .iter()
+                .any(|l| l.text.contains("accepted and stored"))
+        })
+        .await;
+        assert!(
+            !matches!(sw.state(), SwitchState::HostKey { .. }),
+            "the host key question outlived the answer"
+        );
         wait_for("a ready session", || sw.state().is_live()).await;
         sw
     }
@@ -1368,6 +1448,90 @@ mod tests {
             before,
             "nothing may reach the device"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_host_key_ends_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = fake_ios::Transcript::new();
+        let port = fake_ios::spawn(log, "s3cret").await;
+        let mgr = manager();
+        let sw = mgr.connect(target(port, dir.path().join("known_hosts")));
+        wait_for("the host key question", || {
+            matches!(sw.state(), SwitchState::HostKey { .. })
+        })
+        .await;
+
+        sw.answer_host_key(false);
+        wait_for("the session to end", || sw.state().is_over()).await;
+        match sw.state() {
+            SwitchState::Failed { reason } => assert!(reason.contains("host key"), "{reason}"),
+            other => panic!("unexpected state: {other:?}"),
+        }
+        // Nothing was written to known_hosts.
+        assert!(!dir.path().join("known_hosts").exists());
+    }
+
+    /// Accepting the key has to clear the question immediately. While the
+    /// state stayed `HostKey` for the rest of the handshake, the popup kept
+    /// showing the question and every further key press was read as another
+    /// answer to it — the session looked frozen.
+    #[tokio::test]
+    async fn accepting_the_host_key_clears_the_question_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = fake_ios::Transcript::new();
+        // Slow to greet, so the window between "accepted" and "ready" is real.
+        let port =
+            fake_ios::spawn_with_delay(log, "s3cret", Duration::from_millis(1500)).await;
+        let mgr = manager();
+        let sw = mgr.connect(target(port, dir.path().join("known_hosts")));
+        wait_for("the host key question", || {
+            matches!(sw.state(), SwitchState::HostKey { .. })
+        })
+        .await;
+
+        sw.answer_host_key(true);
+        wait_for("the key to be stored", || {
+            sw.transcript()
+                .iter()
+                .any(|l| l.text.contains("accepted and stored"))
+        })
+        .await;
+        // The device has not greeted yet, so the session cannot be ready —
+        // but the question must already be gone.
+        assert!(!sw.state().is_live(), "the device greeted too early for this test");
+        assert!(
+            !matches!(sw.state(), SwitchState::HostKey { .. }),
+            "the host key question outlived the answer: {:?}",
+            sw.state()
+        );
+        wait_for("a ready session", || sw.state().is_live()).await;
+    }
+
+    /// Cancelling must work in every state, including while the session is
+    /// still being set up or parked on the host key question.
+    #[tokio::test]
+    async fn cancel_gets_out_of_a_pending_host_key_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = fake_ios::Transcript::new();
+        let port = fake_ios::spawn(log, "s3cret").await;
+        let mgr = manager();
+        let sw = mgr.connect(target(port, dir.path().join("known_hosts")));
+        wait_for("the host key question", || {
+            matches!(sw.state(), SwitchState::HostKey { .. })
+        })
+        .await;
+
+        sw.cancel();
+        wait_for("the session to end", || sw.state().is_over()).await;
+        assert!(sw.state().is_over(), "cancel left the session hanging");
+    }
+
+    /// A connection nobody answers must not park a session forever.
+    #[test]
+    fn the_host_key_question_has_a_deadline() {
+        assert!(HOST_KEY_TIMEOUT <= Duration::from_secs(300));
+        assert!(HOST_KEY_TIMEOUT >= Duration::from_secs(30));
     }
 
     #[tokio::test]

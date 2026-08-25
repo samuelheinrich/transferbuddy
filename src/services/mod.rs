@@ -328,10 +328,7 @@ impl ServiceManager {
     }
 
     pub fn start(&self, id: ServiceId) {
-        let app = match self.inner.app.lock().unwrap().upgrade() {
-            Some(a) => a,
-            None => return,
-        };
+        let Some(app) = self.app() else { return };
         {
             let status = self.status(id);
             if matches!(status, ServiceStatus::Running | ServiceStatus::Starting) {
@@ -457,15 +454,22 @@ impl ServiceManager {
         });
     }
 
+    /// The shared `App`, without holding the lock afterwards. Taking the guard
+    /// into an `if let` would keep it alive for the whole block, and every
+    /// method that does real work locks it again — that deadlocks.
+    fn app(&self) -> Option<Arc<App>> {
+        let app = self.inner.app.lock().unwrap().upgrade();
+        app
+    }
+
     pub fn start_all_enabled(&self) {
-        if let Some(app) = self.inner.app.lock().unwrap().upgrade() {
-            let enabled: Vec<ServiceId> = {
-                let cfg = app.config.read().unwrap();
-                ServiceId::ALL.iter().copied().filter(|id| cfg.service(*id).enabled).collect()
-            };
-            for id in enabled {
-                self.start(id);
-            }
+        let Some(app) = self.app() else { return };
+        let enabled: Vec<ServiceId> = {
+            let cfg = app.config.read().unwrap();
+            ServiceId::ALL.iter().copied().filter(|id| cfg.service(*id).enabled).collect()
+        };
+        for id in enabled {
+            self.start(id);
         }
     }
 
@@ -473,5 +477,80 @@ impl ServiceManager {
         for id in ServiceId::ALL {
             self.stop(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logging::{LogLevel, Logger};
+
+    /// A real `App` with one service enabled on a free port.
+    fn test_app() -> (tokio::runtime::Runtime, Arc<App>, u16) {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut cfg = Config::default();
+        cfg.root = std::env::temp_dir();
+        cfg.http.enabled = true;
+        cfg.http.port = port;
+        cfg.http.bind = "127.0.0.1".into();
+        let logger = Arc::new(Logger::new(LogLevel::Debug, None, false));
+        let sessions = Arc::new(SessionManager::new(600));
+        let services = ServiceManager::new(rt.handle().clone(), logger.clone(), sessions.clone());
+        let switches = crate::switch::SwitchManager::new(rt.handle().clone(), logger.clone());
+        let app = Arc::new(App {
+            config: std::sync::RwLock::new(cfg),
+            logger,
+            sessions,
+            services,
+            switches,
+            privileged: false,
+            runtime: rt.handle().clone(),
+        });
+        app.services.attach_app(&app);
+        (rt, app, port)
+    }
+
+    /// `S` in the services view used to hang the whole TUI: the `App` guard
+    /// was held across `start()`, which locks it again.
+    #[test]
+    fn start_all_enabled_does_not_deadlock() {
+        let (_rt, app, _port) = test_app();
+        let services = app.clone();
+        let done = std::thread::spawn(move || {
+            services.services.start_all_enabled();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "start_all_enabled deadlocked"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        done.join().unwrap();
+        app.services.stop_all();
+    }
+
+    /// The same for the single-service path, which the deadlock fix touched.
+    #[test]
+    fn start_and_stop_are_reentrant_safe() {
+        let (_rt, app, _port) = test_app();
+        let done = std::thread::spawn(move || {
+            app.services.start(ServiceId::Http);
+            app.services.stop(ServiceId::Http);
+            app.services.start_all_enabled();
+            app.services.stop_all();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "service control deadlocked");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        done.join().unwrap();
     }
 }

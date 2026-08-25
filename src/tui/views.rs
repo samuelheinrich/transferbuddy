@@ -177,7 +177,7 @@ fn draw_dashboard(f: &mut Frame, ui: &Ui, area: Rect) {
     let cfg = ui.app.config.read().unwrap();
     let (completed, bytes) = ui.app.sessions.totals();
     let active = ui.app.sessions.active_count();
-    let (advertised, advertised_source) = super::advertised_now(ui);
+    let (advertised, advertised_source) = super::advertised_now(&cfg);
     let advertised = advertised.map(|i| i.to_string()).unwrap_or_else(|| "-".into());
     let summary = vec![
         Line::from(vec![
@@ -353,8 +353,10 @@ fn draw_dashboard(f: &mut Frame, ui: &Ui, area: Rect) {
         cols[1],
     );
 
-    let (in_use, _) = super::advertised_now(ui);
-    let pinned = ui.app.config.read().unwrap().advertise.is_some();
+    let (in_use, pinned) = {
+        let cfg = ui.app.config.read().unwrap();
+        (super::advertised_now(&cfg).0, cfg.advertise.is_some())
+    };
     let mut if_lines = Vec::new();
     for ifa in crate::netif::interfaces().into_iter().take(6) {
         let active = Some(ifa.ip) == in_use;
@@ -902,7 +904,7 @@ const HELP_RIGHT: &[(&str, KeyRows)] = &[
             ("r", "re-read dir + version"),
             ("x", "disconnect"),
             ("X", "clear closed rows"),
-            ("c", "cancel a running job"),
+            ("c / x", "abort / disconnect"),
             ("y", "trust the host key"),
         ],
     ),
@@ -1527,7 +1529,7 @@ fn draw_modal(f: &mut Frame, ui: &Ui) {
             );
         }
         Modal::Cisco { rel_path, commands, selected, copied } => {
-            let (ip, source) = super::advertised_now(ui);
+            let (ip, source) = super::advertised_now(&ui.app.config.read().unwrap());
             let mut lines = vec![
                 Line::from(vec![
                     theme::label("copy commands for "),
@@ -1824,7 +1826,7 @@ mod tests {
         // The address generated URLs use is named, with where it came from,
         // and the interface it belongs to is marked in the list.
         assert!(dash.contains("address in URLs"), "no advertised address");
-        if let (Some(ip), _) = super::super::advertised_now(&ui) {
+        if let (Some(ip), _) = super::super::advertised_now(&ui.app.config.read().unwrap()) {
             assert!(dash.contains(&ip.to_string()), "address not shown");
             let marked = dash
                 .lines()
@@ -1908,6 +1910,43 @@ mod tests {
         let screen = render_ui(&mut ui);
         assert!(screen.contains("SHA256:abc123"), "no fingerprint");
         assert!(screen.contains("unknown host key"), "no warning");
+    }
+
+    /// The popup must never be a dead end: y accepts, anything else rejects,
+    /// and the rejection has to reach the session that is waiting for it.
+    #[test]
+    fn host_key_popup_always_answers() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        for (key, expected) in [
+            (KeyCode::Char('y'), Some(true)),
+            (KeyCode::Char('n'), Some(false)),
+            (KeyCode::Enter, Some(false)),
+            (KeyCode::Esc, Some(false)),
+            (KeyCode::Char('q'), Some(false)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (_rt, app) = test_app(dir.path().to_path_buf());
+            let mut ui = test_ui(app);
+            let (switch, mut rx) = crate::switch::Switch::for_test_host_key("SHA256:abc");
+            ui.session_view = Some(super::super::SessionView {
+                switch: switch.clone(),
+                scroll: None,
+                jobs_seen: 0,
+            });
+            ui.modal = Some(Modal::Session);
+
+            super::super::handle_key(&mut ui, KeyEvent::from(key));
+            assert_eq!(rx.try_recv().ok(), expected, "wrong answer for {key:?}");
+
+            // Rejecting also aborts, so a session cannot be left parked.
+            if expected == Some(false) {
+                assert!(
+                    switch.cancel_requested() || rx.try_recv().is_err(),
+                    "{key:?} left the session waiting"
+                );
+            }
+        }
     }
 
     #[test]

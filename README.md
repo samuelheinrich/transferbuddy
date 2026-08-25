@@ -230,8 +230,10 @@ switch, so a multi-homed machine advertises the right one.
 
 From there the popup turns into the live session view: what transferbuddy sent
 (`>`), what the device answered, and the `!!!!` progress marks of the running
-`copy`, above a header with the device's facts. `c` cancels, `↑↓` scrolls, `r`
-re-reads the facts, `x` disconnects. The transfer also shows up in the sessions
+`copy`, above a header with the device's facts. `↑↓` scrolls, `r` re-reads the
+facts, `c` or `x` aborts and closes the session, `Esc` just closes the popup
+and leaves the session running. A `copy` cannot be taken back on the device
+side, so aborting one ends the session rather than pretending otherwise. The transfer also shows up in the sessions
 view like any other download, because that is what it is.
 
 The session does **not** end with the copy. It stays open, appears in the
@@ -272,6 +274,10 @@ Passwords are typed only at a `Password:` prompt, are shown as `••••` in
 form, as `********` in the transcript and never reach the log or `config.toml`.
 They are cleared from the form the moment the session has them — host, user,
 protocol and destination are kept, so the next file takes two keystrokes.
+
+The host key question is answered with `y`; every other key rejects it and
+ends the session, so the popup is never a dead end. Unanswered, it times out
+after two minutes rather than parking the session forever.
 
 On the first connection the device's host key is shown as a SHA-256
 fingerprint and, once accepted with `y`, stored in
@@ -547,7 +553,7 @@ intro         = true   # animated intro screen on start
 | `B` | toggle bit/s ↔ byte/s (Sessions) |
 | `G` | follow log tail |
 | `H` | file hashes (MD5/SHA-256/SHA-512) with compare |
-| `c` | cancel a running job (Switches) |
+| `c` / `x` | abort / disconnect a session (Switches) |
 | `r` | re-read dir + show version (Switches) |
 | `x` / `X` | disconnect / clear closed sessions (Switches) |
 | `L` | log level (Logs) · logs of the selected service (Services) |
@@ -594,6 +600,7 @@ use) · `2` invalid configuration/arguments.
 | Upload rejected | uploads are disabled by default (`--uploads`), files are never overwritten, size limit may apply |
 | Deploy says "… is not running" | the deploy only uses services you started — press `s` on the protocol in the services view |
 | Deploy stops at "unexpected prompt" | the device asked something transferbuddy will not answer on its own; the transcript shows the question. Run that `copy` by hand |
+| A session seems stuck | `c` or `x` aborts it in any state, including while it is still connecting; `Ctrl-C` always offers to quit |
 | Deploy fails with "host key … changed" | remove the named line from `state/known_hosts` if the device really was replaced |
 | Flash space shows `—` | the session has not read `dir` yet, or the device answered something unexpected — press `r` in the switches view |
 | Ping always shows `—` | transferbuddy shells out to the system `ping`; a firewall dropping ICMP looks the same as a device being down |

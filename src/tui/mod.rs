@@ -379,7 +379,20 @@ impl Ui {
     }
 }
 
+/// Leave the terminal usable even if something panics: without this the
+/// alternate screen stays up in raw mode and the terminal looks frozen, with
+/// the panic message hidden behind the last frame.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+        previous(info);
+    }));
+}
+
 pub fn run(app: SharedApp) -> Result<()> {
+    install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, EnterAlternateScreen)?;
@@ -564,8 +577,11 @@ fn cycle_advertise(ui: &mut Ui) {
 }
 
 /// The address generated URLs currently use, and where it came from.
-pub fn advertised_now(ui: &Ui) -> (Option<std::net::IpAddr>, String) {
-    let cfg = ui.app.config.read().unwrap();
+///
+/// Takes the config rather than the `Ui`: the draw path already holds the
+/// config lock, and taking it a second time on the same thread is how a
+/// reader-writer lock deadlocks.
+pub fn advertised_now(cfg: &crate::config::Config) -> (Option<std::net::IpAddr>, String) {
     let ip = cfg.advertised_ip("0.0.0.0", None);
     let source = match (&cfg.advertise, ip) {
         (Some(pin), Some(ip)) => match crate::netif::resolve_advertise(pin) {
@@ -1128,32 +1144,43 @@ fn handle_session_key(ui: &mut Ui, key: KeyEvent) {
     };
     let switch = view.switch.clone();
     if let SwitchState::HostKey { .. } = switch.state() {
+        // Anything other than yes is a no — and a no must reach the waiting
+        // session, not just close the popup.
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => switch.answer_host_key(true),
-            KeyCode::Esc => ui.modal = None,
-            _ => switch.answer_host_key(false),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                switch.cancel();
+                ui.modal = None;
+                ui.status_msg = Some("host key rejected — session aborted".into());
+            }
+            _ => {
+                switch.answer_host_key(false);
+                ui.status_msg = Some("host key rejected — session aborted".into());
+            }
         }
         return;
     }
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => ui.modal = None,
         KeyCode::Char('c') => {
-            if matches!(switch.state(), SwitchState::Busy { .. }) {
-                switch.cancel();
-                ui.status_msg = Some("cancelling — the session is closed with it".into());
-            }
+            disconnect_switch(ui, &switch, "cancelled — the session is closed with it");
         }
         KeyCode::Char('r') => {
             if switch.submit(Job::Facts) {
                 ui.status_msg = Some("re-reading dir and show version".into());
             }
         }
-        KeyCode::Char('x') => {
-            switch.submit(Job::Disconnect);
-            ui.status_msg = Some("disconnecting".into());
-        }
+        KeyCode::Char('x') => disconnect_switch(ui, &switch, "disconnecting"),
         _ => scroll_session(view, key),
     }
+}
+
+/// Stop a session whatever it is doing: a queued `exit` only helps a session
+/// that is idle, so the abort flag is set as well.
+fn disconnect_switch(ui: &mut Ui, switch: &Arc<Switch>, msg: &str) {
+    switch.submit(Job::Disconnect);
+    switch.cancel();
+    ui.status_msg = Some(msg.to_string());
 }
 
 fn field_buffer(form: &mut DeployForm, field: DeployField) -> &mut String {
@@ -1220,10 +1247,18 @@ fn handle_switches_key(ui: &mut Ui, key: KeyEvent) {
                 }
             }
         }
-        KeyCode::Char('x') => {
+        KeyCode::Char('x') | KeyCode::Char('c') => {
             if let Some(sw) = selected_switch(ui) {
-                sw.submit(Job::Disconnect);
-                ui.status_msg = Some(format!("disconnecting {}", sw.display_name()));
+                let msg = format!("disconnecting {}", sw.display_name());
+                disconnect_switch(ui, &sw, &msg);
+            }
+        }
+        KeyCode::Char('y') => {
+            // Trust the host key of the selected session without opening it.
+            if let Some(sw) = selected_switch(ui) {
+                if matches!(sw.state(), SwitchState::HostKey { .. }) {
+                    sw.answer_host_key(true);
+                }
             }
         }
         KeyCode::Char('X') => {
