@@ -6,11 +6,11 @@
 # and drop the `head`-style local install below.
 class Transferbuddy < Formula
   desc "Multi-protocol file transfer server (FTP/HTTP/HTTPS/SCP/SFTP/TFTP) with a TUI, built for provisioning Cisco devices"
-  homepage "https://github.com/samuel-heinrich/transferbuddy"
-  url "https://github.com/samuel-heinrich/transferbuddy/archive/refs/tags/v0.2.tar.gz"
+  homepage "https://github.com/samuelheinrich/transferbuddy"
+  url "https://github.com/samuelheinrich/transferbuddy/archive/refs/tags/v0.2.tar.gz"
   sha256 :no_check # replace with the real tarball sha256 when tagging a release
   license "MIT"
-  head "https://github.com/samuel-heinrich/transferbuddy.git", branch: "main"
+  head "https://github.com/samuelheinrich/transferbuddy.git", branch: "main"
 
   depends_on "rust" => :build
 
