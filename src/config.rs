@@ -13,6 +13,9 @@ use crate::services::ServiceId;
 #[serde(default)]
 pub struct Config {
     /// Shared root directory. Everything below it is served, nothing above it.
+    /// Never persisted: transferbuddy always serves the directory it was
+    /// started in, unless `--root` says otherwise.
+    #[serde(skip)]
     pub root: PathBuf,
 
     pub http: ServiceConfig,
@@ -195,7 +198,8 @@ impl Config {
 
     /// Merge CLI flags over the loaded config and resolve "auto" values.
     pub fn apply_cli(&mut self, cli: &Cli, privileged: bool) -> Result<()> {
-        // Root directory: CLI > config > cwd. A relative stored root means "cwd".
+        // Root directory: CLI > cwd. The root is never read from config.toml,
+        // so starting transferbuddy somewhere else always serves that place.
         if let Some(root) = &cli.root {
             self.root = root.clone();
         } else if self.root.as_os_str().is_empty() || self.root == Path::new(".") {
@@ -369,6 +373,7 @@ impl Config {
 mod tests {
     use super::*;
     use crate::services::ServiceId;
+    use clap::Parser;
 
     #[test]
     fn default_ports_by_privilege() {
@@ -414,6 +419,22 @@ mod tests {
     }
 
     #[test]
+    fn stale_root_in_config_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "root = \"/old/pinned/path\"\nintro = false\n").unwrap();
+        let mut cfg = Config::load(Some(&file)).unwrap();
+        // Container-level `#[serde(default)]` fills the skipped field from
+        // `Config::default()`, i.e. "." — which apply_cli resolves to the cwd.
+        assert_eq!(cfg.root, PathBuf::from("."), "root must not come from config.toml");
+        assert!(!cfg.intro, "other settings must still load");
+
+        let cli = Cli::parse_from(["transferbuddy"]);
+        cfg.apply_cli(&cli, false).unwrap();
+        assert_eq!(cfg.root, std::env::current_dir().unwrap().canonicalize().unwrap());
+    }
+
+    #[test]
     fn config_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = Config::default();
@@ -422,9 +443,11 @@ mod tests {
         c.http.port = 9999;
         c.auth.username = "svc".into();
         c.auth.password = "must-not-persist".into();
+        c.root = PathBuf::from("/somewhere/else");
         c.save().unwrap();
         let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(!text.contains("must-not-persist"), "password leaked into config.toml");
+        assert!(!text.contains("/somewhere/else"), "root leaked into config.toml");
         let loaded = Config::load(Some(&dir.path().join("config.toml"))).unwrap();
         assert!(loaded.http.enabled);
         assert_eq!(loaded.http.port, 9999);

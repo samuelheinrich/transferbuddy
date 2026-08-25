@@ -49,6 +49,47 @@ Until the formula is published, install from a local tap using
 brew install --build-from-source Formula/transferbuddy.rb
 ```
 
+### System-wide (`/usr/local/bin`)
+
+Build the binary first, then copy it into `/usr/local/bin` so `transferbuddy`
+is available to every user and every shell, independent of where the repository
+lives. For the current architecture only:
+
+```bash
+cargo build --release
+sudo install -m 755 target/release/transferbuddy /usr/local/bin/transferbuddy
+```
+
+For a universal binary that runs on both Apple Silicon and Intel — see
+[Release builds](#release-builds) for the full recipe:
+
+```bash
+cargo build --release --target aarch64-apple-darwin
+cargo build --release --target x86_64-apple-darwin
+mkdir -p dist && lipo -create -output dist/transferbuddy \
+  target/aarch64-apple-darwin/release/transferbuddy \
+  target/x86_64-apple-darwin/release/transferbuddy
+sudo install -m 755 dist/transferbuddy /usr/local/bin/transferbuddy
+```
+
+Verify the installation:
+
+```bash
+which transferbuddy      # → /usr/local/bin/transferbuddy
+transferbuddy --version
+```
+
+Notes:
+
+- `sudo` prompts for a password, so run the install command in a real terminal
+  — it fails in editor consoles and other non-interactive shells.
+- Use `install` (or `cp`), not a symlink. A symlink into the repository ties
+  the installed command to that checkout, which breaks if the directory is
+  moved, deleted or lives on a cloud-synced volume that is not mounted.
+- No `sudo`? `~/.local/bin` works the same way if it is on your `PATH`.
+- The installed file is a snapshot — re-run the `install` command after every
+  release build.
+
 ### From source
 
 Requires a Rust toolchain (`rustup`, stable):
@@ -309,6 +350,11 @@ Persistent state lives in:
 Settings changed in the TUI are saved automatically. CLI flags override the
 stored configuration for the current run.
 
+The shared root is deliberately **not** part of `config.toml`: transferbuddy
+always serves the directory it was started in, unless `--root` says otherwise.
+Starting it somewhere else therefore always shares that place, and a `root =`
+key left over from an older version is ignored.
+
 Beyond ports and services, `config.toml` also holds the UI preferences:
 
 ```toml
@@ -381,6 +427,7 @@ use) · `2` invalid configuration/arguments.
 | `copy https:` fails on the device | the self-signed certificate isn't trusted; install it as a trustpoint or use HTTP |
 | SCP/SFTP host key error on device | the host key changed; clear the old known-host entry on the device |
 | Upload rejected | uploads are disabled by default (`--uploads`), files are never overwritten, size limit may apply |
+| Wrong directory shared | the root always follows the working directory — check the dashboard's `root:` line, and `--root` if you passed it. Older builds pinned the root in `config.toml`; the stale `root =` key is now ignored, so re-installing is enough |
 
 ## Development
 
