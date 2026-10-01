@@ -26,13 +26,8 @@ use crate::services::{ServiceId, ServiceManager};
 use crate::session::SessionManager;
 use crate::switch::SwitchManager;
 
-/// User-visible version: major.minor only (0.1, 0.2, 0.3, ...). The patch
-/// component of the Cargo version is an implementation detail Cargo requires.
-pub const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION_MAJOR"),
-    ".",
-    env!("CARGO_PKG_VERSION_MINOR")
-);
+/// One full version for the TUI, CLI and release builds.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Everything the services, the TUI and the headless runner share.
 pub struct App {
@@ -71,7 +66,20 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let logger = Arc::new(Logger::new(config.log_level, config.log_file_path(), cli.no_tui));
+    let logger = Arc::new(Logger::new(
+        config.log_level,
+        config.log_file_path(),
+        cli.no_tui,
+    ));
+    if let Some(pin) = config.advertise.as_deref() {
+        if netif::resolve_advertise(pin).is_none() {
+            logger.log_simple(
+                LogLevel::Warning,
+                "core",
+                format!("interface {pin} is unavailable — using automatic address selection"),
+            );
+        }
+    }
     let sessions = Arc::new(SessionManager::new(config.session_history_secs));
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -195,7 +203,9 @@ fn print_status(app: &SharedApp) {
             .map(|i| i.to_string())
             .unwrap_or_else(|| "-".into()),
         match &cfg.advertise {
-            Some(pin) => format!("  ({pin}, pinned with --interface)"),
+            Some(pin) if netif::resolve_advertise(pin).is_some() =>
+                format!("  ({pin}, pinned with --interface)"),
+            Some(pin) => format!("  ({pin} unavailable — automatic selection)"),
             None => "  (automatic — pin one with --interface)".into(),
         }
     );

@@ -34,6 +34,20 @@ pub fn service_of(proto: Protocol) -> ServiceId {
     }
 }
 
+// Encode reserved URL characters in transfer credentials, including @ and :.
+fn encode_userinfo(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
 /// The source URL a device uses to fetch `rel_path` from transferbuddy.
 /// `needs_port` reports whether the port had to be spelled out.
 fn source_url(proto: Protocol, cfg: &Config, ip: &IpAddr, rel_path: &str) -> (String, bool) {
@@ -44,8 +58,8 @@ fn source_url(proto: Protocol, cfg: &Config, ip: &IpAddr, rel_path: &str) -> (St
         Ok(bound) if !bound.is_unspecified() => fmt_ip(&bound),
         _ => fmt_ip(ip),
     };
-    let user = &cfg.auth.username;
-    let pass = &cfg.auth.password;
+    let user = encode_userinfo(&cfg.auth.username);
+    let pass = encode_userinfo(&cfg.auth.password);
     let rel = rel_path.trim_start_matches('/');
     let needs_port = sc.port != cisco_default_port(proto);
     let port_part = if needs_port { format!(":{}", sc.port) } else { String::new() };
@@ -53,8 +67,8 @@ fn source_url(proto: Protocol, cfg: &Config, ip: &IpAddr, rel_path: &str) -> (St
         Protocol::Http => format!("http://{host}{port_part}/{rel}"),
         Protocol::Https => format!("https://{host}{port_part}/{rel}"),
         Protocol::Ftp => format!("ftp://{user}:{pass}@{host}{port_part}/{rel}"),
-        Protocol::Scp => format!("scp://{user}@{host}{port_part}/{rel}"),
-        Protocol::Sftp => format!("sftp://{user}@{host}{port_part}/{rel}"),
+        Protocol::Scp => format!("scp://{user}:{pass}@{host}{port_part}/{rel}"),
+        Protocol::Sftp => format!("sftp://{user}:{pass}@{host}{port_part}/{rel}"),
         // IOS `copy tftp://` does not accept a port at all.
         Protocol::Tftp => format!("tftp://{host}/{rel}"),
     };
@@ -472,14 +486,32 @@ mod tests {
         );
         assert_eq!(
             copy_command(Protocol::Scp, &c, &ip(), "img.bin"),
-            "copy scp://cisco@192.168.1.10:2222/img.bin flash:"
+            "copy scp://cisco:secret@192.168.1.10:2222/img.bin flash:"
         );
         assert_eq!(
             copy_command(Protocol::Sftp, &c, &ip(), "img.bin"),
-            "copy sftp://cisco@192.168.1.10:2222/img.bin flash:"
+            "copy sftp://cisco:secret@192.168.1.10:2222/img.bin flash:"
         );
         // TFTP cannot carry a port in IOS; the command warns instead.
         assert!(copy_command(Protocol::Tftp, &c, &ip(), "img.bin").contains("port 6969"));
+    }
+
+    #[test]
+    fn passwords_are_included_and_reserved_characters_are_encoded() {
+        let mut c = cfg(false);
+        c.auth.username = "net@admin".into();
+        c.auth.password = "p:a@ss;word".into();
+        for (proto, scheme) in [
+            (Protocol::Ftp, "ftp"),
+            (Protocol::Scp, "scp"),
+            (Protocol::Sftp, "sftp"),
+        ] {
+            let command = deploy_command(proto, &c, &ip(), "img.bin", "flash:").unwrap();
+            assert!(
+                command.contains(&format!("{scheme}://net%40admin:p%3Aa%40ss%3Bword@")),
+                "{command}"
+            );
+        }
     }
 
     #[test]

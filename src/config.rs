@@ -336,21 +336,13 @@ impl Config {
                     id.default_port(false)
                 );
             }
-            sc.bind
-                .parse::<std::net::IpAddr>()
-                .map_err(|_| anyhow::anyhow!("invalid bind address for {}: {}", id.display_name(), sc.bind))?;
-        }
-        if let Some(iface) = &self.advertise {
-            if crate::netif::resolve_advertise(iface).is_none() {
-                bail!(
-                    "no local interface or address {iface:?} — available: {}",
-                    crate::netif::candidates()
-                        .iter()
-                        .map(|i| format!("{} ({})", i.name, i.ip))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
+            sc.bind.parse::<std::net::IpAddr>().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid bind address for {}: {}",
+                    id.display_name(),
+                    sc.bind
+                )
+            })?;
         }
         if self.uploads.enabled {
             let dir = self.upload_dir_abs();
@@ -432,6 +424,18 @@ mod tests {
         let err = c.validate(false).unwrap_err().to_string();
         assert!(err.contains("sudo"), "unexpected message: {err}");
         assert!(c.validate(true).is_ok());
+    }
+
+    #[test]
+    fn missing_advertise_interface_does_not_block_startup() {
+        let mut c = Config::default();
+        for id in ServiceId::ALL { c.service_mut(id).bind = "0.0.0.0".into(); }
+        c.advertise = Some("utun-transferbuddy-nonexistent".into());
+        c.validate(false).unwrap();
+        assert_eq!(
+            c.advertised_ip("127.0.0.1", None),
+            Some("127.0.0.1".parse().unwrap())
+        );
     }
 
     #[test]

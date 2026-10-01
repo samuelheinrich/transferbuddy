@@ -146,7 +146,7 @@ the clipboard.
 ## The TUI
 
 A keyboard-driven Atari-8bit-flavoured terminal UI: dark CRT background, amber
-titles, phosphor-green highlights. Five views, switched with `1`–`5`, `Tab` or
+titles, phosphor-green highlights. Six views, switched with `1`–`6`, `Tab` or
 `←`/`→`; the current view's keys are always listed in the footer.
 
 ### Intro
@@ -224,7 +224,19 @@ from the device side — no console, no copy-paste:
 ```
 
 `↑↓` moves between fields, `←→`/`Space` cycles the protocol and toggles
-`overwrite`, `Enter` starts. The line above the keys is the exact command that
+`overwrite`. `Enter` on the protocol field opens its selection menu; on another
+field it submits the form. `Ctrl+Enter` submits from any field. Text fields show
+a blinking `_` cursor, and pasted text is accepted directly. In the protocol
+selection menu, `s` starts the highlighted server without closing the menu.
+Running servers are green; stopped servers are red throughout the TUI.
+
+`Ctrl+s` starts the selected protocol's server from the form. If you submit a
+deploy with its server stopped, transferbuddy asks **"not started — do you want
+to start it?"** (`y` / `n`). After `y`, it waits until the server is listening
+before sending the copy. A bind failure stays visible in the form, and `Esc`
+cancels a pending deploy.
+
+The line above the keys is the exact command that
 will be typed — the source address is the local IP that actually routes to the
 switch, so a multi-homed machine advertises the right one.
 
@@ -237,13 +249,13 @@ side, so aborting one ends the session rather than pretending otherwise. The tra
 view like any other download, because that is what it is.
 
 The session does **not** end with the copy. It stays open, appears in the
-[switches view](#6--switches) and is ready for the next file — the second
+[upgrade view](#6--upgrade) and is ready for the next file — the second
 deploy to the same switch needs no password at all.
 
 **What transferbuddy is allowed to do on your switch**
 
 The whole point of the feature is that it stays inside a very small box. Every
-line that goes to a device passes a whitelist, and the whitelist has six
+line that goes to a device passes a whitelist, and the whitelist has seven
 entries:
 
 | Line | Why |
@@ -253,6 +265,7 @@ entries:
 | `show version` | IOS version, model, serial, uptime, stack members |
 | `dir <device>:` | free flash space, read before and after every copy |
 | `copy <transferbuddy URL> <device>:` | the actual transfer |
+| `install remove inactive` | preview and explicitly confirm removal of inactive packages |
 | `exit` | leave the session cleanly |
 
 The two read-only ones are just as narrow as the rest: only `show version`, no
@@ -268,7 +281,8 @@ The prompts `copy` asks are answered just as narrowly. `Destination filename`,
 Enter; `Do you want to over write?` follows the `overwrite` setting; anything
 about erasing or formatting is always declined; and a prompt transferbuddy does
 not recognise ends the session instead of being confirmed blindly. The only
-answers it can send are Enter and `n`.
+answers the copy workflow can send are Enter and `n`. Cleanup uses a separate
+confirmation path which sends `y` only after the user explicitly presses `y`.
 
 Passwords are typed only at a `Password:` prompt, are shown as `••••` in the
 form, as `********` in the transcript and never reach the log or `config.toml`.
@@ -289,7 +303,9 @@ it is never silently accepted.
 
 Every connection with protocol, source, user, file, direction, state, progress
 and current speed. `B` toggles between bit/s and byte/s; the detail pane adds
-average speed, duration and ETA.
+average speed, duration and ETA. Transfer timing stops when the file has been
+transferred, even if the FTP or SSH connection remains open; each subsequent
+transfer on that connection starts with fresh counters.
 
 ![transferbuddy sessions view](docs/screenshots/sessions.svg)
 
@@ -297,36 +313,84 @@ average speed, duration and ETA.
 
 Structured, colour-coded log with live tail (`G`), text filter (`/`), minimum
 level (`L`) and protocol filter (`P`). From the services view, `L` jumps
-straight to the log filtered to that protocol.
+straight to the log filtered to that protocol. Transfer entries include readable
+sizes (MB, GB, etc.), the exact byte count in parentheses, duration and average
+speed. Long lines wrap so these values stay visible at normal terminal widths.
 
 ![transferbuddy log view](docs/screenshots/logs.svg)
 
-### 6 · Switches
+### 6 · Upgrade
 
-Every SSH session transferbuddy holds open to a device, one per row: name (the
-device's own hostname, taken from its prompt), address, user, state, IOS-XE
-version, model, free flash and the current ping. The pane below shows the
-selected device in full, including the stack members.
+The sidebar provides **Choose file**, **Add device +**, **Bulk import**,
+**Deploy selected** and **Remove inactive**. `Tab` or `←→` switches focus between the sidebar and the
+device table; `↑↓` selects an action or a device, and `Enter` activates it.
+Use `1`–`6` to change views while this screen has focus. The selected file and
+its size are shown in a dedicated panel on the right, above the devices.
 
-```
-name             host              user      state   IOS-XE    model          flash free      ping
-SG-AS-OG5-01     10.20.30.40:22    netadmin  ready   17.15.03  C9200L-48P-4X  235 MB (88%)    1.2 ms
+- `f` selects a file from the shared directory, including subdirectories.
+- `a` adds one device with IP/hostname, SSH port, username, password, enable
+  password and transfer protocol.
+- `b` imports IP addresses separated by spaces, commas, semicolons or pasted
+  newlines. Credentials and protocol are entered once for the whole list;
+  duplicate IPs are removed and the entire list is validated first. Unknown
+  **and changed SSH host keys are automatically trusted and stored** for bulk
+  imports. Existing sessions are reused; reconnecting replaces failed/closed
+  rows instead of listing the same endpoint twice.
+- In Bulk import, enable **scan subnet (exp.)** with Space or Left/Right and
+  enter one IPv4 CIDR such as `192.168.10.0/24`. The experimental scan supports
+  `/16` through `/32`, excludes network/broadcast addresses where applicable,
+  and runs up to **32 asynchronous pings** at once with a two-second hard
+  timeout. Only responding IPs are added for SSH; up to **16 SSH connections**
+  are established concurrently. The discovery panel updates live while the
+  device table shows connection results. `S` cancels discovery; connections
+  already added remain available. Devices that block ICMP are skipped.
+- `i` runs **install remove inactive** on the selected idle device. Before
+  sending the command, transferbuddy refreshes the running IOS and stack
+  versions. When the switch asks to remove files, the actual deletion list is
+  shown. A prominent **DANGER** warning appears if any candidate matches the
+  running release of any member or the active system image. Missing version
+  information or an unrecognized deletion list also produces a warning.
+  **Only lowercase `y` confirms; every other key aborts**, including Enter,
+  Escape and Ctrl-C. No deletion is confirmed automatically. A switch with
+  nothing to clean completes without a confirmation. Flash usage is refreshed
+  after either completion or a declined deletion.
+- `d` opens the deploy form for the selected device and chosen file. The open
+  SSH session supplies the credentials and the device's chosen protocol.
 
- state    ready — 504057659 bytes copied in 728.176 secs (692220 bytes/sec)
- device   C9200L-48P-4X   IOS-XE 17.15.03   uptime 47 weeks, 6 days, 23 hours
- flash    235 MB free of 1957 MB (88% used) on flash:   ping 1.2 ms
- stack    1:17.15.03  *2:17.15.03  3:17.15.03
-```
+In Add device and Bulk import, `Enter` advances to the next field. Select the
+protocol with `Enter`, then confirm on the final **[ Enter ] Add device(s)**
+button. This is the point where SSH connections are opened.
 
-`Enter` opens the session with its full transcript, `r` re-reads `dir` and
-`show version`, `x` disconnects, `X` drops closed rows from the list.
+**Adding a device only checks SSH and reads its facts. It never starts a
+file transfer.** For a single-device add, unknown host keys appear as
+`host key?`; select the device and press `y` to trust it, or `Enter` to inspect
+its fingerprint. Waiting for the answer does not consume the connection
+timeout. Bulk import and subnet scan automatically accept replacement keys. Start the
+deploy separately when ready. Device credentials stay in memory for this run.
+
+The table shows hostname/address, model, IOS version, stack member count,
+flash usage (for example `1305 MB free of 1957 MB (33% used)`), whether the
+selected file fits, and connection state. On wide terminals it also shows
+protocol, progress, current speed and ETA. The detail pane and SSH console also show the file's total size, the bytes
+already sent in MB/GB, average speed and ETA calculated from the current speed.
+These values come from the matching FTP/HTTP/HTTPS/SCP/SFTP/TFTP session on the
+file server; the switch's `!!!!!` output remains visible in the transcript.
+The detail pane also retains IOS version, model, flash usage, ping and stack
+members.
+
+With the device table focused, `Enter` opens the full SSH transcript. `r`
+refreshes `dir` and `show version`, `x` disconnects, and `X` removes closed rows.
+During a copy, `r` uses a **second SSH connection** with the same credentials,
+so the copy's console remains available for its progress output. If the device
+refuses that connection, the refresh error is reported without interrupting
+the transfer.
 
 **Free flash space** comes from the footer `dir` prints —
 `1956839424 bytes total (234979328 bytes free)` — and is shown in MB, with how
 much of the device is used. It is read when a session opens and again after
-every copy, so the number on screen is the one that matters for the next
-image. When a session is open, the deploy form compares the file against it
-and says outright whether the image still fits.
+every copy. When a session is open, the deploy form compares the file against
+it and says whether the image fits. The overview recalculates this comparison
+for every device whenever the selected file or reported flash usage changes.
 
 **The stack row** lists every member with its software version, the active one
 marked `*`. Members that do not match the system version are highlighted —
@@ -378,9 +442,11 @@ transferbuddy --http --interface en12     # or --interface 10.41.10.108
 transferbuddy --http --no-tui             # lists every interface it could use
 ```
 
-An interface that no longer exists is refused at startup with the list of the
-ones that do, and if it disappears while running, transferbuddy falls back to
-the automatic choice instead of handing out a dead address.
+If the selected interface no longer exists (for example, after a VPN disconnect),
+transferbuddy starts normally and falls back to automatic address selection,
+with a warning in the log. The saved preference is kept so it can be used
+again when the interface returns. The same fallback applies if the interface
+disappears while running.
 
 Two things still win over this setting, because they have to:
 
@@ -420,8 +486,8 @@ via CLI flags (`--port-http`, `--port-https`, `--port-ftp`, `--port-sftp`,
 | HTTP     | no        | none (download)    | opt-in  | `copy http://192.168.1.10:8080/img.bin flash:` |
 | HTTPS    | yes (TLS) | none (download)    | opt-in  | `copy https://192.168.1.10:8443/img.bin flash:` |
 | FTP      | no        | user/password      | opt-in  | `copy ftp://user:pass@192.168.1.10:2121/img.bin flash:` |
-| SFTP     | yes (SSH) | user/password      | opt-in  | `copy sftp://user@192.168.1.10:2222/img.bin flash:` |
-| SCP      | yes (SSH) | user/password      | opt-in  | `copy scp://user@192.168.1.10:2222/img.bin flash:` |
+| SFTP     | yes (SSH) | user/password      | opt-in  | `copy sftp://user:pass@192.168.1.10:2222/img.bin flash:` |
+| SCP      | yes (SSH) | user/password      | opt-in  | `copy scp://user:pass@192.168.1.10:2222/img.bin flash:` |
 | TFTP     | no        | none               | opt-in  | `copy tftp://192.168.1.10/img.bin flash:` |
 
 SFTP and SCP share one SSH service (one port, one host key, one user account).
@@ -537,7 +603,7 @@ intro         = true   # animated intro screen on start
 | `m` | sound on/off |
 | `i` | interface used in generated URLs |
 | `Tab` / `1`–`6` | switch view |
-| `f` / `a` / `l` / `c` / `w` | files / sessions / logs / services / switches |
+| `f` / `a` / `l` / `c` / `w` | files / sessions / logs / services / upgrade |
 | arrows / `j` `k` | navigate |
 | `Enter` | open directory / show Cisco commands / select |
 | `Space` | enable/disable service |
@@ -553,9 +619,16 @@ intro         = true   # animated intro screen on start
 | `B` | toggle bit/s ↔ byte/s (Sessions) |
 | `G` | follow log tail |
 | `H` | file hashes (MD5/SHA-256/SHA-512) with compare |
-| `c` / `x` | abort / disconnect a session (Switches) |
-| `r` | re-read dir + show version (Switches) |
-| `x` / `X` | disconnect / clear closed sessions (Switches) |
+| `c` / `x` | abort / disconnect a session (Upgrade) |
+| `r` | re-read dir + show version (Upgrade; second SSH connection during copy) |
+| `a` / `b` | Add device / Bulk import (Upgrade) |
+| `i` | install remove inactive (Upgrade / switch console) |
+| `S` | cancel experimental subnet discovery (Upgrade) |
+| `f` / `d` | Choose file / Deploy selected (Upgrade) |
+| `Tab` | sidebar / device table (Upgrade) |
+| `Ctrl+s` | start selected server (Deploy) |
+| `Ctrl+Enter` | submit deploy / add form from any field |
+| `x` / `X` | disconnect / clear closed sessions (Upgrade) |
 | `L` | log level (Logs) · logs of the selected service (Services) |
 | `P` | protocol filter (Logs) |
 
@@ -602,7 +675,7 @@ use) · `2` invalid configuration/arguments.
 | Deploy stops at "unexpected prompt" | the device asked something transferbuddy will not answer on its own; the transcript shows the question. Run that `copy` by hand |
 | A session seems stuck | `c` or `x` aborts it in any state, including while it is still connecting; `Ctrl-C` always offers to quit |
 | Deploy fails with "host key … changed" | remove the named line from `state/known_hosts` if the device really was replaced |
-| Flash space shows `—` | the session has not read `dir` yet, or the device answered something unexpected — press `r` in the switches view |
+| Flash space shows `—` | the session has not read `dir` yet, or the device answered something unexpected — press `r` in the upgrade view |
 | Ping always shows `—` | transferbuddy shells out to the system `ping`; a firewall dropping ICMP looks the same as a device being down |
 | Wrong directory shared | the root always follows the working directory — check the dashboard's `root:` line, and `--root` if you passed it. Older builds pinned the root in `config.toml`; the stale `root =` key is now ignored, so re-installing is enough |
 

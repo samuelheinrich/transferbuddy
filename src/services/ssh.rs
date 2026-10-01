@@ -411,6 +411,7 @@ async fn scp_source(
             .bytes(size)
             .duration_ms(start.elapsed().as_millis() as u64),
     );
+    ctx.sessions.finish(sid, SessionState::Completed);
     Ok(())
 }
 
@@ -508,6 +509,7 @@ async fn scp_sink(
                         .bytes(size)
                         .duration_ms(start.elapsed().as_millis() as u64),
                 );
+                ctx.sessions.finish(sid, SessionState::Completed);
             }
             b'T' => {
                 io.send(&[0]).await?; // timestamps — accepted and ignored
@@ -725,8 +727,21 @@ impl russh_sftp::server::Handler for SftpSession {
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
         if let Some(open) = self.files.remove(&handle) {
             match open {
-                OpenFile::Read { rel, size, started, done, .. } => {
-                    self.ctx.sessions.update(self.sid, |s| s.state = SessionState::Connected);
+                OpenFile::Read {
+                    rel,
+                    size,
+                    started,
+                    done,
+                    ..
+                } => {
+                    self.ctx.sessions.finish(
+                        self.sid,
+                        if done {
+                            SessionState::Completed
+                        } else {
+                            SessionState::Aborted
+                        },
+                    );
                     if done {
                         self.ctx.logger.log(
                             Event::new(LogLevel::Info, "sftp", "download")
@@ -759,6 +774,9 @@ impl russh_sftp::server::Handler for SftpSession {
                                 );
                             }
                             Err(e) => {
+                                self.ctx
+                                    .sessions
+                                    .finish(self.sid, SessionState::Failed(e.clone()));
                                 self.ctx.logger.log(
                                     Event::new(LogLevel::Warning, "sftp", "upload")
                                         .ip(self.peer.ip())

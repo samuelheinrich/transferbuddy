@@ -84,10 +84,23 @@ impl LogEntry {
             s.push_str(&format!(" result={r}"));
         }
         if let Some(b) = self.bytes {
-            s.push_str(&format!(" bytes={b}"));
+            s.push_str(&format!(
+                " size={} ({b} bytes)",
+                crate::session::fmt_bytes(b)
+            ));
         }
         if let Some(d) = self.duration_ms {
-            s.push_str(&format!(" duration={d}ms"));
+            if d < 1000 {
+                s.push_str(&format!(" duration={d}ms"));
+            } else {
+                s.push_str(&format!(" duration={:.2}s", d as f64 / 1000.0));
+            }
+            if let Some(b) = self.bytes.filter(|_| d > 0) {
+                s.push_str(&format!(
+                    " avg={}",
+                    crate::session::fmt_speed(b as f64 * 1000.0 / d as f64, false)
+                ));
+            }
         }
         if let Some(e) = &self.error {
             s.push_str(&format!(" error=\"{e}\""));
@@ -223,5 +236,29 @@ impl Logger {
     /// Snapshot of the ring buffer for the TUI log view.
     pub fn entries(&self) -> Vec<LogEntry> {
         self.buffer.lock().unwrap().iter().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_log_has_readable_size_duration_and_average_speed() {
+        let entry = Event::new(LogLevel::Info, "ftp", "download")
+            .bytes(32_000_000)
+            .duration_ms(2000)
+            .entry;
+        let line = entry.render_line();
+        assert!(line.contains("size=32.0 MB (32000000 bytes)"));
+        assert!(line.contains("duration=2.00s"));
+        assert!(line.contains("avg=16.0 MB/s"));
+        let line = Event::new(LogLevel::Info, "ftp", "download")
+            .bytes(0)
+            .duration_ms(0)
+            .entry
+            .render_line();
+        assert!(!line.contains("avg="));
+        assert!(!line.contains("NaN"));
     }
 }

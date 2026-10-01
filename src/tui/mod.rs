@@ -6,11 +6,16 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
-use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event as CEvent, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers,
+};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::prelude::*;
 
 use crate::logging::{Event, LogLevel};
@@ -20,8 +25,6 @@ use crate::sound::Tone;
 use crate::switch::{Job, Switch, SwitchState, Target};
 use crate::SharedApp;
 
-
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Dashboard,
@@ -29,7 +32,7 @@ pub enum Tab {
     Files,
     Sessions,
     Logs,
-    Switches,
+    Upgrade,
 }
 
 impl Tab {
@@ -39,7 +42,7 @@ impl Tab {
         Tab::Files,
         Tab::Sessions,
         Tab::Logs,
-        Tab::Switches,
+        Tab::Upgrade,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -48,7 +51,7 @@ impl Tab {
             Tab::Files => "3 Files",
             Tab::Sessions => "4 Sessions",
             Tab::Logs => "5 Logs",
-            Tab::Switches => "6 Switches",
+            Tab::Upgrade => "6 Upgrade",
         }
     }
 }
@@ -111,7 +114,11 @@ impl FileBrowser {
 
     fn refresh(&mut self, root: &PathBuf) {
         self.error = None;
-        let dir = if self.cwd.is_empty() { root.clone() } else { root.join(&self.cwd) };
+        let dir = if self.cwd.is_empty() {
+            root.clone()
+        } else {
+            root.join(&self.cwd)
+        };
         let mut entries = Vec::new();
         match std::fs::read_dir(&dir) {
             Ok(rd) => {
@@ -141,13 +148,18 @@ impl FileBrowser {
         }
         match self.sort {
             SortBy::Name => entries.sort_by(|a, b| {
-                b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                b.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             }),
             SortBy::Size => {
                 entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| b.size.cmp(&a.size)))
             }
-            SortBy::Modified => entries
-                .sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| b.modified.cmp(&a.modified))),
+            SortBy::Modified => entries.sort_by(|a, b| {
+                b.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| b.modified.cmp(&a.modified))
+            }),
         }
         self.entries = entries;
         if self.selected >= self.visible().len() {
@@ -208,7 +220,11 @@ impl EditField {
     pub fn is_editable(self) -> bool {
         matches!(
             self,
-            EditField::Port | EditField::Bind | EditField::Username | EditField::Password | EditField::UploadDir
+            EditField::Port
+                | EditField::Bind
+                | EditField::Username
+                | EditField::Password
+                | EditField::UploadDir
         )
     }
 }
@@ -240,6 +256,8 @@ pub enum DeployField {
     Protocol,
     Destination,
     Overwrite,
+    ScanSubnet,
+    Submit,
 }
 
 impl DeployField {
@@ -253,6 +271,25 @@ impl DeployField {
         DeployField::Destination,
         DeployField::Overwrite,
     ];
+    pub const ADD: [DeployField; 7] = [
+        DeployField::Host,
+        DeployField::Port,
+        DeployField::Username,
+        DeployField::Password,
+        DeployField::EnablePassword,
+        DeployField::Protocol,
+        DeployField::Submit,
+    ];
+    pub const BULK: [DeployField; 8] = [
+        DeployField::Host,
+        DeployField::Port,
+        DeployField::Username,
+        DeployField::Password,
+        DeployField::EnablePassword,
+        DeployField::ScanSubnet,
+        DeployField::Protocol,
+        DeployField::Submit,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             DeployField::Host => "switch IP / host",
@@ -263,11 +300,19 @@ impl DeployField {
             DeployField::Protocol => "protocol",
             DeployField::Destination => "destination",
             DeployField::Overwrite => "overwrite",
+            DeployField::ScanSubnet => "scan subnet (exp.)",
+            DeployField::Submit => "",
         }
     }
     /// Rows that take typed text (the others toggle or cycle).
     pub fn is_text(self) -> bool {
-        !matches!(self, DeployField::Protocol | DeployField::Overwrite)
+        !matches!(
+            self,
+            DeployField::Protocol
+                | DeployField::Overwrite
+                | DeployField::ScanSubnet
+                | DeployField::Submit
+        )
     }
 }
 
@@ -284,6 +329,7 @@ pub struct DeployForm {
     pub proto: Protocol,
     pub dest: String,
     pub overwrite: bool,
+    pub scan_subnet: bool,
     pub field: usize,
 }
 
@@ -298,6 +344,7 @@ impl Default for DeployForm {
             proto: Protocol::Http,
             dest: "flash:".into(),
             overwrite: false,
+            scan_subnet: false,
             field: 0,
         }
     }
@@ -305,6 +352,13 @@ impl Default for DeployForm {
 
 /// The deploy form for one file. The live session it starts lives in
 /// [`crate::switch`] and is shown by [`Modal::Session`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DeployMode {
+    Copy,
+    Add,
+    Bulk,
+}
+
 pub struct DeployView {
     /// File being deployed, relative to the shared root.
     pub rel_path: String,
@@ -328,17 +382,37 @@ pub enum Modal {
     Help,
     ConfirmQuit,
     ConfirmUploads,
-    Input { title: String, value: String, action: InputAction },
-    Cisco { rel_path: String, commands: Vec<(Protocol, String)>, selected: usize, copied: bool },
+    Input {
+        title: String,
+        value: String,
+        action: InputAction,
+    },
+    Cisco {
+        rel_path: String,
+        commands: Vec<(Protocol, String)>,
+        selected: usize,
+        copied: bool,
+    },
     Message(String),
     /// Per-service edit popup. `editing` holds the in-progress text when an
     /// editable field is being typed into.
-    ServiceEdit { id: ServiceId, field: usize, editing: Option<String> },
+    ServiceEdit {
+        id: ServiceId,
+        field: usize,
+        editing: Option<String>,
+    },
     /// File hash view; the data lives in `Ui::hashes` so it survives the
     /// detour through the compare-input modal.
     Hashes,
     /// Deploy form; the data lives in `Ui::deploy`.
     Deploy,
+    DeployProtocol {
+        selected: usize,
+    },
+    ConfirmStart {
+        id: ServiceId,
+    },
+    UpgradeFiles,
     /// Live transcript of one switch session; the data lives in
     /// `Ui::session_view`.
     Session,
@@ -369,6 +443,10 @@ pub struct Ui {
     pub session_view: Option<SessionView>,
     /// Selected row in the switches view.
     pub switch_sel: usize,
+    pub upgrade_menu: Option<usize>,
+    pub upgrade_file: Option<(String, u64)>,
+    pub deploy_mode: DeployMode,
+    pub pending_deploy: Option<(ServiceId, Instant)>,
 }
 
 impl Ui {
@@ -386,7 +464,11 @@ fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste
+        );
         previous(info);
     }));
 }
@@ -395,7 +477,7 @@ pub fn run(app: SharedApp) -> Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    crossterm::execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -410,12 +492,19 @@ pub fn run(app: SharedApp) -> Result<()> {
     };
 
     disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    )?;
     terminal.show_cursor()?;
     result
 }
 
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: SharedApp) -> Result<()> {
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: SharedApp,
+) -> Result<()> {
     let mut ui = Ui {
         app,
         tab: Tab::Dashboard,
@@ -435,15 +524,24 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: Sha
         deploy: None,
         session_view: None,
         switch_sel: 0,
+        upgrade_menu: Some(0),
+        upgrade_file: None,
+        deploy_mode: DeployMode::Copy,
+        pending_deploy: None,
     };
     let root = ui.app.config.read().unwrap().root.clone();
     ui.files.refresh(&root);
 
     loop {
+        pump_pending_deploy(&mut ui);
+        for switch in ui.app.switches.list() {
+            switch.transfer(&ui.app.sessions);
+        }
         pump_session(&mut ui);
         terminal.draw(|f| views::draw(f, &mut ui))?;
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
+                CEvent::Paste(text) => handle_paste(&mut ui, text),
                 CEvent::Key(key) if key.kind == KeyEventKind::Press => handle_key(&mut ui, key),
                 _ => {}
             }
@@ -455,12 +553,37 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: Sha
 }
 
 fn handle_key(ui: &mut Ui, key: KeyEvent) {
+    // Confirmation owns every key, including Ctrl-C and global shortcuts.
+    if matches!(ui.modal, Some(Modal::Session))
+        && ui
+            .session_view
+            .as_ref()
+            .is_some_and(|v| matches!(v.switch.state(), SwitchState::CleanupConfirm { .. }))
+    {
+        handle_session_key(ui, key);
+        return;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         ui.modal = Some(Modal::ConfirmQuit);
         return;
     }
     if ui.modal.is_some() {
         handle_modal_key(ui, key);
+        return;
+    }
+    if ui.tab == Tab::Upgrade
+        && matches!(
+            key.code,
+            KeyCode::Tab
+                | KeyCode::BackTab
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Char('a')
+                | KeyCode::Char('f')
+                | KeyCode::Char('i')
+        )
+    {
+        handle_switches_key(ui, key);
         return;
     }
     match key.code {
@@ -489,7 +612,11 @@ fn handle_key(ui: &mut Ui, key: KeyEvent) {
             // Beep only when switching on — the off-beep would be the last
             // thing you hear after asking for silence.
             crate::sound::play(enabled, Tone::On);
-            ui.status_msg = Some(if enabled { "sound on".into() } else { "sound off".into() });
+            ui.status_msg = Some(if enabled {
+                "sound on".into()
+            } else {
+                "sound off".into()
+            });
         }
         KeyCode::Tab | KeyCode::Right => {
             let i = Tab::ALL.iter().position(|t| *t == ui.tab).unwrap_or(0);
@@ -503,7 +630,11 @@ fn handle_key(ui: &mut Ui, key: KeyEvent) {
         }
         KeyCode::Char('1') => ui.tab = Tab::Dashboard,
         KeyCode::Char('2') => ui.tab = Tab::Services,
-        KeyCode::Char('c') if ui.tab != Tab::Files && ui.tab != Tab::Logs => ui.tab = Tab::Services,
+        KeyCode::Char('c')
+            if ui.tab != Tab::Files && ui.tab != Tab::Logs && ui.tab != Tab::Upgrade =>
+        {
+            ui.tab = Tab::Services
+        }
         KeyCode::Char('3') | KeyCode::Char('f') => {
             ui.tab = Tab::Files;
             let root = ui.app.config.read().unwrap().root.clone();
@@ -512,7 +643,8 @@ fn handle_key(ui: &mut Ui, key: KeyEvent) {
         KeyCode::Char('4') | KeyCode::Char('a') => ui.tab = Tab::Sessions,
         KeyCode::Char('5') | KeyCode::Char('l') => ui.tab = Tab::Logs,
         KeyCode::Char('6') | KeyCode::Char('w') if ui.tab != Tab::Services => {
-            ui.tab = Tab::Switches
+            ui.tab = Tab::Upgrade;
+            on_tab_changed(ui);
         }
         KeyCode::Char('i') => cycle_advertise(ui),
         _ => match ui.tab {
@@ -521,14 +653,14 @@ fn handle_key(ui: &mut Ui, key: KeyEvent) {
             Tab::Files => handle_files_key(ui, key),
             Tab::Sessions => handle_sessions_key(ui, key),
             Tab::Logs => handle_logs_key(ui, key),
-            Tab::Switches => handle_switches_key(ui, key),
+            Tab::Upgrade => handle_switches_key(ui, key),
         },
     }
 }
 
 /// Refresh view-specific state after switching tabs (e.g. re-read the file list).
 fn on_tab_changed(ui: &mut Ui) {
-    if ui.tab == Tab::Files {
+    if matches!(ui.tab, Tab::Files | Tab::Upgrade) {
         let root = ui.app.config.read().unwrap().root.clone();
         ui.files.refresh(&root);
     }
@@ -555,7 +687,11 @@ fn cycle_advertise(ui: &mut Ui) {
                 .unwrap_or(0),
         };
         let next = (current + 1) % (list.len() + 1);
-        cfg.advertise = if next == 0 { None } else { Some(list[next - 1].name.clone()) };
+        cfg.advertise = if next == 0 {
+            None
+        } else {
+            Some(list[next - 1].name.clone())
+        };
         cfg.advertise.clone()
     };
     save_config(ui);
@@ -585,7 +721,10 @@ pub fn advertised_now(cfg: &crate::config::Config) -> (Option<std::net::IpAddr>,
     let ip = cfg.advertised_ip("0.0.0.0", None);
     let source = match (&cfg.advertise, ip) {
         (Some(pin), Some(ip)) => match crate::netif::resolve_advertise(pin) {
-            Some(_) => format!("{} pinned", crate::netif::interface_of(&ip).unwrap_or_else(|| pin.clone())),
+            Some(_) => format!(
+                "{} pinned",
+                crate::netif::interface_of(&ip).unwrap_or_else(|| pin.clone())
+            ),
             None => format!("{pin} is gone — using automatic"),
         },
         (None, Some(ip)) => format!(
@@ -629,8 +768,11 @@ fn handle_services_key(ui: &mut Ui, key: KeyEvent) {
             if !enabled && ui.app.services.status(id).is_running() {
                 ui.app.services.stop(id);
             }
-            ui.status_msg =
-                Some(format!("{} {}", id.display_name(), if enabled { "enabled" } else { "disabled" }));
+            ui.status_msg = Some(format!(
+                "{} {}",
+                id.display_name(),
+                if enabled { "enabled" } else { "disabled" }
+            ));
         }
         KeyCode::Char('s') => {
             if ui.app.services.status(id).is_running() {
@@ -714,7 +856,11 @@ fn handle_services_key(ui: &mut Ui, key: KeyEvent) {
             ui.tab = Tab::Logs;
         }
         KeyCode::Enter | KeyCode::Char('e') => {
-            ui.modal = Some(Modal::ServiceEdit { id, field: 0, editing: None });
+            ui.modal = Some(Modal::ServiceEdit {
+                id,
+                field: 0,
+                editing: None,
+            });
         }
         _ => {}
     }
@@ -731,7 +877,11 @@ fn handle_files_key(ui: &mut Ui, key: KeyEvent) {
             }
         }
         KeyCode::Enter => {
-            let entry = ui.files.visible().get(ui.files.selected).map(|e| (*e).clone());
+            let entry = ui
+                .files
+                .visible()
+                .get(ui.files.selected)
+                .map(|e| (*e).clone());
             if let Some(entry) = entry {
                 if entry.is_dir {
                     if ui.files.cwd.is_empty() {
@@ -758,7 +908,11 @@ fn handle_files_key(ui: &mut Ui, key: KeyEvent) {
             }
         }
         KeyCode::Char('H') => {
-            let entry = ui.files.visible().get(ui.files.selected).map(|e| (*e).clone());
+            let entry = ui
+                .files
+                .visible()
+                .get(ui.files.selected)
+                .map(|e| (*e).clone());
             if let Some(entry) = entry {
                 if !entry.is_dir {
                     open_hashes_modal(ui, &root, &entry.name);
@@ -781,7 +935,11 @@ fn handle_files_key(ui: &mut Ui, key: KeyEvent) {
             });
         }
         KeyCode::Char('d') | KeyCode::Char('D') => {
-            let entry = ui.files.visible().get(ui.files.selected).map(|e| (*e).clone());
+            let entry = ui
+                .files
+                .visible()
+                .get(ui.files.selected)
+                .map(|e| (*e).clone());
             if let Some(entry) = entry {
                 if entry.is_dir {
                     ui.status_msg = Some("deploy works on files, not directories".into());
@@ -792,7 +950,11 @@ fn handle_files_key(ui: &mut Ui, key: KeyEvent) {
         }
         KeyCode::Char('R') | KeyCode::F(5) => ui.files.refresh(&root),
         KeyCode::Char('y') => {
-            let entry = ui.files.visible().get(ui.files.selected).map(|e| (*e).clone());
+            let entry = ui
+                .files
+                .visible()
+                .get(ui.files.selected)
+                .map(|e| (*e).clone());
             if let Some(entry) = entry {
                 if !entry.is_dir {
                     open_cisco_modal(ui, &entry.name);
@@ -816,14 +978,24 @@ fn open_cisco_modal(ui: &mut Ui, name: &str) {
     let mut commands = crate::cisco::commands_for_file(&cfg, &ip, &rel);
     if commands.is_empty() {
         // No service enabled yet — show all so the user sees what's possible.
-        for proto in
-            [Protocol::Http, Protocol::Https, Protocol::Ftp, Protocol::Scp, Protocol::Sftp, Protocol::Tftp]
-        {
+        for proto in [
+            Protocol::Http,
+            Protocol::Https,
+            Protocol::Ftp,
+            Protocol::Scp,
+            Protocol::Sftp,
+            Protocol::Tftp,
+        ] {
             commands.push((proto, crate::cisco::copy_command(proto, &cfg, &ip, &rel)));
         }
     }
     drop(cfg);
-    ui.modal = Some(Modal::Cisco { rel_path: rel, commands, selected: 0, copied: false });
+    ui.modal = Some(Modal::Cisco {
+        rel_path: rel,
+        commands,
+        selected: 0,
+        copied: false,
+    });
 }
 
 fn open_hashes_modal(ui: &mut Ui, root: &PathBuf, name: &str) {
@@ -836,7 +1008,13 @@ fn open_hashes_modal(ui: &mut Ui, root: &PathBuf, name: &str) {
     ui.status_msg = Some(format!("hashing {rel} …"));
     match compute_hashes(&abs) {
         Ok((md5, sha256, sha512)) => {
-            ui.hashes = Some(HashInfo { rel_path: rel, md5, sha256, sha512, compare: None });
+            ui.hashes = Some(HashInfo {
+                rel_path: rel,
+                md5,
+                sha256,
+                sha512,
+                compare: None,
+            });
             ui.status_msg = None;
             ui.modal = Some(Modal::Hashes);
         }
@@ -865,7 +1043,11 @@ fn compute_hashes(path: &std::path::Path) -> std::io::Result<(String, String, St
         sha256.update(&buf[..n]);
         sha512.update(&buf[..n]);
     }
-    Ok((hex(&md5.finalize()), hex(&sha256.finalize()), hex(&sha512.finalize())))
+    Ok((
+        hex(&md5.finalize()),
+        hex(&sha256.finalize()),
+        hex(&sha512.finalize()),
+    ))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -880,7 +1062,11 @@ fn hex(bytes: &[u8]) -> String {
 /// detected from its length (32/64/128 hex chars = MD5/SHA-256/SHA-512) so the
 /// user only has to paste a value.
 fn compare_hash(info: &HashInfo, input: &str) -> HashCompare {
-    let norm: String = input.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase();
+    let norm: String = input
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
     let is_hex = !norm.is_empty() && norm.chars().all(|c| c.is_ascii_hexdigit());
     let (kind, expected): (&'static str, Option<&str>) = if !is_hex {
         ("?", None)
@@ -893,7 +1079,11 @@ fn compare_hash(info: &HashInfo, input: &str) -> HashCompare {
         }
     };
     let matched = expected.map(|e| e == norm).unwrap_or(false);
-    HashCompare { input: norm, kind, matched }
+    HashCompare {
+        input: norm,
+        kind,
+        matched,
+    }
 }
 
 /// Protocols offered in the deploy form, in the order the selector cycles.
@@ -909,19 +1099,30 @@ const DEPLOY_PROTOCOLS: [Protocol; 6] = [
 /// Open the deploy form for one file. Host, user and destination from the
 /// previous deploy are kept; the passwords are not.
 fn open_deploy_modal(ui: &mut Ui, name: &str, size: u64) {
+    ui.deploy_mode = DeployMode::Copy;
+    ui.pending_deploy = None;
     let rel = if ui.files.cwd.is_empty() {
         name.to_string()
     } else {
         format!("{}/{}", ui.files.cwd, name)
     };
-    let mut form = ui.deploy.as_ref().map(|d| d.form.clone()).unwrap_or_default();
+    let mut form = ui
+        .deploy
+        .as_ref()
+        .map(|d| d.form.clone())
+        .unwrap_or_default();
     form.password.clear();
     form.enable_password.clear();
     form.field = 0;
     if form.username.is_empty() {
         form.proto = default_deploy_protocol(ui);
     }
-    ui.deploy = Some(DeployView { rel_path: rel, size, form, error: None });
+    ui.deploy = Some(DeployView {
+        rel_path: rel,
+        size,
+        form,
+        error: None,
+    });
     ui.modal = Some(Modal::Deploy);
 }
 
@@ -929,7 +1130,12 @@ fn open_deploy_modal(ui: &mut Ui, name: &str, size: u64) {
 fn default_deploy_protocol(ui: &Ui) -> Protocol {
     let cfg = ui.app.config.read().unwrap();
     for proto in DEPLOY_PROTOCOLS {
-        if ui.app.services.status(crate::cisco::service_of(proto)).is_running() {
+        if ui
+            .app
+            .services
+            .status(crate::cisco::service_of(proto))
+            .is_running()
+        {
             return proto;
         }
     }
@@ -970,15 +1176,26 @@ fn redact_url_password(cmd: &str) -> String {
 
 /// Show a switch session, following its tail.
 fn open_session_view(ui: &mut Ui, switch: Arc<Switch>) {
-    ui.session_view = Some(SessionView { jobs_seen: switch.jobs_done(), switch, scroll: None });
+    ui.session_view = Some(SessionView {
+        jobs_seen: switch.jobs_done(),
+        switch,
+        scroll: None,
+    });
     ui.modal = Some(Modal::Session);
 }
 
 /// Validate the form, open (or reuse) the session and queue the copy.
 fn start_deploy(ui: &mut Ui) {
-    let Some(view) = ui.deploy.as_ref() else { return };
+    if ui.deploy_mode != DeployMode::Copy {
+        add_devices(ui);
+        return;
+    }
+    let Some(view) = ui.deploy.as_ref() else {
+        return;
+    };
     let form = view.form.clone();
     let rel = view.rel_path.clone();
+    let size = view.size;
 
     let fail = |ui: &mut Ui, msg: String| {
         if let Some(v) = ui.deploy.as_mut() {
@@ -1007,12 +1224,19 @@ fn start_deploy(ui: &mut Ui) {
 
     let id = crate::cisco::service_of(form.proto);
     if !ui.app.services.status(id).is_running() {
+        // The form remains intact while the user decides and the listener binds.
+        ui.modal = Some(Modal::ConfirmStart { id });
+        return;
+    }
+    if existing.as_ref().is_some_and(|s| {
+        matches!(
+            s.state(),
+            SwitchState::Busy { .. } | SwitchState::CleanupConfirm { .. }
+        )
+    }) {
         return fail(
             ui,
-            format!(
-                "{} is not running — start it in the services view (2, then s)",
-                id.display_name()
-            ),
+            "this device is busy — wait for its current job to finish".into(),
         );
     }
 
@@ -1039,14 +1263,18 @@ fn start_deploy(ui: &mut Ui) {
                 password: form.password.clone(),
                 enable_password: form.enable_password.clone(),
                 known_hosts,
+                auto_trust: false,
             })
         }
     };
-    switch.submit(Job::Copy {
+    switch.begin_transfer(rel.clone(), size, form.proto);
+    if !switch.submit(Job::Copy {
         rel_path: rel.clone(),
         command: command.clone(),
         overwrite: form.overwrite,
-    });
+    }) {
+        return fail(ui, "SSH session is closed — reconnect the device".into());
+    }
 
     let mut ev = Event::new(LogLevel::Info, "deploy", format!("start on {host}"))
         .path(rel)
@@ -1067,7 +1295,9 @@ fn start_deploy(ui: &mut Ui) {
 
 /// Announce finished jobs of the session on screen once each.
 fn pump_session(ui: &mut Ui) {
-    let Some(view) = ui.session_view.as_mut() else { return };
+    let Some(view) = ui.session_view.as_mut() else {
+        return;
+    };
     let done = view.switch.jobs_done();
     if done == view.jobs_seen {
         return;
@@ -1092,23 +1322,332 @@ fn pump_session(ui: &mut Ui) {
     ui.beep(tone);
 }
 
+pub fn deploy_fields(mode: DeployMode) -> &'static [DeployField] {
+    if mode == DeployMode::Copy {
+        &DeployField::ALL
+    } else if mode == DeployMode::Bulk {
+        &DeployField::BULK
+    } else {
+        &DeployField::ADD
+    }
+}
+
+fn start_deploy_service(ui: &mut Ui, id: ServiceId) {
+    if ui.app.services.status(id).is_running() {
+        return;
+    }
+    ui.app.config.write().unwrap().service_mut(id).enabled = true;
+    save_config(ui);
+    ui.app.services.start(id);
+    ui.status_msg = Some(format!("{} starting", id.display_name()));
+}
+
+fn pump_pending_deploy(ui: &mut Ui) {
+    let Some((id, started)) = ui.pending_deploy else {
+        return;
+    };
+    if !matches!(ui.modal, Some(Modal::Deploy)) {
+        ui.pending_deploy = None;
+        return;
+    }
+    match ui.app.services.status(id) {
+        crate::services::ServiceStatus::Running => {
+            ui.pending_deploy = None;
+            start_deploy(ui);
+        }
+        crate::services::ServiceStatus::Failed(error) => {
+            ui.pending_deploy = None;
+            if let Some(view) = ui.deploy.as_mut() {
+                view.error = Some(format!("server could not start: {error}"));
+            }
+        }
+        _ if started.elapsed() > Duration::from_secs(15) => {
+            ui.pending_deploy = None;
+            if let Some(view) = ui.deploy.as_mut() {
+                view.error = Some("server did not start within 15s — retry with Ctrl+s".into());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Validate every entry before opening any connection. Keep the input order
+/// while removing duplicates so bulk pastes cannot add the same device twice.
+fn bulk_hosts(input: &str) -> Result<Vec<String>, String> {
+    let mut hosts = Vec::new();
+    for token in input
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|s| !s.is_empty())
+    {
+        let ip: std::net::IpAddr = token
+            .parse()
+            .map_err(|_| format!("invalid IP address: {token}"))?;
+        let host = ip.to_string();
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    if hosts.is_empty() {
+        return Err("enter at least one device IP address".into());
+    }
+    Ok(hosts)
+}
+
+fn add_devices(ui: &mut Ui) {
+    let Some(view) = ui.deploy.as_ref() else {
+        return;
+    };
+    let form = view.form.clone();
+    let hosts = if ui.deploy_mode == DeployMode::Bulk {
+        if form.scan_subnet {
+            crate::switch::subnet_hosts(&form.host)
+        } else {
+            bulk_hosts(&form.host)
+        }
+    } else if form.host.trim().is_empty() {
+        Err("enter the switch IP or hostname".into())
+    } else if form.host.trim().chars().any(char::is_whitespace) {
+        Err("enter one hostname or IP address".into())
+    } else {
+        Ok(vec![form.host.trim().to_string()])
+    };
+    let validated = (|| {
+        let hosts = hosts?;
+        let port = form
+            .port
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p > 0)
+            .ok_or_else(|| "invalid SSH port".to_string())?;
+        if form.username.trim().is_empty() {
+            return Err("enter the SSH username".into());
+        }
+        if form.password.is_empty() {
+            return Err("enter the SSH password".into());
+        }
+        crate::deploy::vet(&form.password, crate::deploy::Wire::Secret)?;
+        crate::deploy::vet(&form.enable_password, crate::deploy::Wire::Secret)?;
+        Ok((hosts, port))
+    })();
+    let (hosts, port) = match validated {
+        Ok(values) => values,
+        Err(error) => {
+            if let Some(view) = ui.deploy.as_mut() {
+                view.error = Some(error);
+            }
+            return;
+        }
+    };
+    let known_hosts = ui
+        .app
+        .config
+        .read()
+        .unwrap()
+        .config_dir
+        .join("state/known_hosts");
+    if ui.deploy_mode == DeployMode::Bulk && form.scan_subnet {
+        let target = Target {
+            host: String::new(),
+            port,
+            username: form.username.trim().into(),
+            password: form.password.clone(),
+            enable_password: form.enable_password.clone(),
+            known_hosts,
+            auto_trust: true,
+        };
+        if let Err(error) = ui.app.switches.start_scan(target, &form.host, form.proto) {
+            if let Some(view) = ui.deploy.as_mut() {
+                view.error = Some(error);
+            }
+            return;
+        }
+        if let Some(view) = ui.deploy.as_mut() {
+            view.form.password.clear();
+            view.form.enable_password.clear();
+        }
+        ui.tab = Tab::Upgrade;
+        ui.upgrade_menu = None;
+        ui.modal = None;
+        ui.status_msg = Some(
+            "experimental subnet scan started — live ping/SSH progress; S cancels discovery".into(),
+        );
+        return;
+    }
+    let mut added = 0;
+    for host in hosts {
+        let switch = ui
+            .app
+            .switches
+            .find_live(&host, port, form.username.trim())
+            .unwrap_or_else(|| {
+                added += 1;
+                ui.app.switches.connect(Target {
+                    host,
+                    port,
+                    username: form.username.trim().into(),
+                    password: form.password.clone(),
+                    enable_password: form.enable_password.clone(),
+                    known_hosts: known_hosts.clone(),
+                    auto_trust: ui.deploy_mode == DeployMode::Bulk,
+                })
+            });
+        switch.set_protocol(form.proto);
+    }
+    if let Some(view) = ui.deploy.as_mut() {
+        view.form.password.clear();
+        view.form.enable_password.clear();
+    }
+    ui.tab = Tab::Upgrade;
+    ui.upgrade_menu = None;
+    ui.modal = None;
+    ui.status_msg = Some(format!(
+        "{added} device(s) added — checking SSH; deploy starts separately with d"
+    ));
+}
+
+fn handle_paste(ui: &mut Ui, text: String) {
+    if matches!(ui.modal, Some(Modal::Session)) {
+        if let Some(view) = &ui.session_view {
+            if matches!(view.switch.state(), SwitchState::CleanupConfirm { .. }) {
+                view.switch.answer_cleanup(false);
+                return;
+            }
+        }
+    }
+    match &ui.modal {
+        Some(Modal::Deploy) => {
+            if let Some(view) = ui.deploy.as_mut() {
+                let field = deploy_fields(ui.deploy_mode)[view.form.field];
+                if field.is_text() {
+                    let text = if ui.deploy_mode == DeployMode::Bulk && field == DeployField::Host {
+                        text
+                    } else {
+                        text.replace(['\n', '\r'], "")
+                    };
+                    field_buffer(&mut view.form, field).push_str(&text);
+                    view.error = None;
+                }
+            }
+        }
+        Some(Modal::Input { .. }) => {
+            if let Some(Modal::Input { value, .. }) = ui.modal.as_mut() {
+                value.push_str(&text.replace(['\n', '\r'], ""));
+            }
+        }
+        Some(Modal::ServiceEdit { .. }) => {
+            if let Some(Modal::ServiceEdit {
+                editing: Some(value),
+                ..
+            }) = ui.modal.as_mut()
+            {
+                value.push_str(&text.replace(['\n', '\r'], ""));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_upgrade_files_key(ui: &mut Ui, key: KeyEvent) {
+    let root = ui.app.config.read().unwrap().root.clone();
+    match key.code {
+        KeyCode::Esc => ui.modal = None,
+        KeyCode::Enter => {
+            let entry = ui
+                .files
+                .visible()
+                .get(ui.files.selected)
+                .map(|e| ((*e).name.clone(), e.is_dir, e.size));
+            if let Some((name, is_dir, size)) = entry {
+                if is_dir {
+                    ui.files.cwd = if ui.files.cwd.is_empty() {
+                        name
+                    } else {
+                        format!("{}/{name}", ui.files.cwd)
+                    };
+                    ui.files.selected = 0;
+                    ui.files.refresh(&root);
+                } else {
+                    let rel = if ui.files.cwd.is_empty() {
+                        name
+                    } else {
+                        format!("{}/{name}", ui.files.cwd)
+                    };
+                    ui.upgrade_file = Some((rel, size));
+                    ui.modal = None;
+                    ui.status_msg =
+                        Some("file selected — d deploys it to the selected device".into());
+                }
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => ui.files.selected = ui.files.selected.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            ui.files.selected =
+                (ui.files.selected + 1).min(ui.files.visible().len().saturating_sub(1))
+        }
+        KeyCode::Backspace => {
+            ui.files.cwd = ui
+                .files
+                .cwd
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+                .unwrap_or_default();
+            ui.files.selected = 0;
+            ui.files.refresh(&root);
+        }
+        KeyCode::Char('R') => ui.files.refresh(&root),
+        _ => {}
+    }
+}
+
 fn handle_deploy_key(ui: &mut Ui, key: KeyEvent) {
     let Some(view) = ui.deploy.as_mut() else {
         ui.modal = None;
         return;
     };
-    let fields = DeployField::ALL;
+    if ui.pending_deploy.is_some() && key.code != KeyCode::Esc {
+        return;
+    }
+    let fields = deploy_fields(ui.deploy_mode);
     let cur = fields[view.form.field.min(fields.len() - 1)];
     match key.code {
-        KeyCode::Esc => ui.modal = None,
+        KeyCode::Esc => {
+            ui.modal = None;
+            ui.pending_deploy = None;
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => start_deploy(ui),
+        KeyCode::Enter if cur == DeployField::Protocol => {
+            ui.modal = Some(Modal::DeployProtocol {
+                selected: DEPLOY_PROTOCOLS
+                    .iter()
+                    .position(|p| *p == view.form.proto)
+                    .unwrap_or(0),
+            });
+        }
+        KeyCode::Enter if ui.deploy_mode != DeployMode::Copy && cur != DeployField::Submit => {
+            view.form.field = (view.form.field + 1).min(fields.len() - 1);
+        }
         KeyCode::Enter => start_deploy(ui),
+        KeyCode::Char('s')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && ui.deploy_mode == DeployMode::Copy =>
+        {
+            let id = crate::cisco::service_of(view.form.proto);
+            start_deploy_service(ui, id);
+        }
         KeyCode::Up | KeyCode::BackTab => view.form.field = view.form.field.saturating_sub(1),
         KeyCode::Down | KeyCode::Tab => {
             view.form.field = (view.form.field + 1).min(fields.len() - 1)
         }
-        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if !cur.is_text() => {
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if matches!(
+                cur,
+                DeployField::Protocol | DeployField::Overwrite | DeployField::ScanSubnet
+            ) =>
+        {
             match cur {
                 DeployField::Overwrite => view.form.overwrite = !view.form.overwrite,
+                DeployField::ScanSubnet => view.form.scan_subnet = !view.form.scan_subnet,
                 _ => {
                     let i = DEPLOY_PROTOCOLS
                         .iter()
@@ -1160,13 +1699,18 @@ fn handle_session_key(ui: &mut Ui, key: KeyEvent) {
         }
         return;
     }
+    if matches!(switch.state(), SwitchState::CleanupConfirm { .. }) {
+        switch.answer_cleanup(key.code == KeyCode::Char('y') && key.modifiers.is_empty());
+        return;
+    }
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => ui.modal = None,
+        KeyCode::Char('i') => start_cleanup(ui, switch),
         KeyCode::Char('c') => {
             disconnect_switch(ui, &switch, "cancelled — the session is closed with it");
         }
         KeyCode::Char('r') => {
-            if switch.submit(Job::Facts) {
+            if ui.app.switches.refresh_facts(switch.clone()) {
                 ui.status_msg = Some("re-reading dir and show version".into());
             }
         }
@@ -1192,7 +1736,10 @@ fn field_buffer(form: &mut DeployForm, field: DeployField) -> &mut String {
         DeployField::EnablePassword => &mut form.enable_password,
         DeployField::Destination => &mut form.dest,
         // Not text fields; never reached, but a buffer has to be returned.
-        DeployField::Protocol | DeployField::Overwrite => &mut form.dest,
+        DeployField::Protocol
+        | DeployField::Overwrite
+        | DeployField::ScanSubnet
+        | DeployField::Submit => &mut form.dest,
     }
 }
 
@@ -1213,7 +1760,11 @@ fn scroll_session(view: &mut SessionView, key: KeyEvent) {
         }
         KeyCode::PageDown => {
             let cur = view.scroll.unwrap_or(len);
-            view.scroll = if cur + 15 >= len { None } else { Some(cur + 15) };
+            view.scroll = if cur + 15 >= len {
+                None
+            } else {
+                Some(cur + 15)
+            };
         }
         KeyCode::End | KeyCode::Char('G') => view.scroll = None,
         _ => {}
@@ -1223,26 +1774,140 @@ fn scroll_session(view: &mut SessionView, key: KeyEvent) {
 /// The switch the cursor is on in the switches view.
 fn selected_switch(ui: &Ui) -> Option<Arc<Switch>> {
     let list = ui.app.switches.list();
-    list.get(ui.switch_sel.min(list.len().saturating_sub(1))).cloned()
+    list.get(ui.switch_sel.min(list.len().saturating_sub(1)))
+        .cloned()
+}
+
+const UPGRADE_ACTIONS: [&str; 5] = [
+    "Choose file",
+    "Add device +",
+    "Bulk import",
+    "Deploy selected",
+    "Remove inactive",
+];
+
+fn start_cleanup(ui: &mut Ui, switch: Arc<Switch>) {
+    if switch.state() != SwitchState::Ready {
+        ui.status_msg = Some("cleanup requires an idle, connected device".into());
+        return;
+    }
+    if switch.submit(Job::RemoveInactive) {
+        open_session_view(ui, switch);
+    }
+}
+
+fn activate_upgrade_action(ui: &mut Ui, action: usize) {
+    match action {
+        4 => {
+            if let Some(sw) = selected_switch(ui) {
+                start_cleanup(ui, sw);
+            }
+        }
+        0 => {
+            let root = ui.app.config.read().unwrap().root.clone();
+            ui.files.refresh(&root);
+            ui.modal = Some(Modal::UpgradeFiles);
+        }
+        1 | 2 => {
+            ui.deploy_mode = if action == 1 {
+                DeployMode::Add
+            } else {
+                DeployMode::Bulk
+            };
+            let mut form = DeployForm::default();
+            if let Some(previous) = &ui.deploy {
+                form.username = previous.form.username.clone();
+                form.proto = previous.form.proto;
+            }
+            ui.deploy = Some(DeployView {
+                rel_path: String::new(),
+                size: 0,
+                form,
+                error: None,
+            });
+            ui.modal = Some(Modal::Deploy);
+        }
+        3 => {
+            let Some((rel_path, size)) = ui.upgrade_file.clone() else {
+                ui.status_msg = Some("choose a file first (f)".into());
+                return;
+            };
+            let Some(switch) = selected_switch(ui) else {
+                ui.status_msg = Some("add a device first (a / b)".into());
+                return;
+            };
+            if switch.state().is_over() {
+                ui.status_msg = Some("device is disconnected — add it again to reconnect".into());
+                return;
+            }
+            let form = DeployForm {
+                host: switch.host.clone(),
+                port: switch.port.to_string(),
+                username: switch.username.clone(),
+                proto: switch.protocol(),
+                field: DeployField::ALL
+                    .iter()
+                    .position(|f| *f == DeployField::Protocol)
+                    .unwrap(),
+                ..DeployForm::default()
+            };
+            ui.deploy_mode = DeployMode::Copy;
+            ui.deploy = Some(DeployView {
+                rel_path,
+                size,
+                form,
+                error: None,
+            });
+            ui.modal = Some(Modal::Deploy);
+        }
+        _ => {}
+    }
 }
 
 fn handle_switches_key(ui: &mut Ui, key: KeyEvent) {
     let count = ui.app.switches.list().len();
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => ui.switch_sel = ui.switch_sel.saturating_sub(1),
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+            ui.upgrade_menu = if ui.upgrade_menu.is_some() {
+                None
+            } else {
+                Some(0)
+            };
+        }
+        KeyCode::Char('a') => activate_upgrade_action(ui, 1),
+        KeyCode::Char('b') => activate_upgrade_action(ui, 2),
+        KeyCode::Char('f') => activate_upgrade_action(ui, 0),
+        KeyCode::Char('d') => activate_upgrade_action(ui, 3),
+        KeyCode::Char('i') => activate_upgrade_action(ui, 4),
+        KeyCode::Char('S') => {
+            if let Some(scan) = ui.app.switches.scan() {
+                scan.cancel();
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(menu) = ui.upgrade_menu.as_mut() {
+                *menu = menu.saturating_sub(1);
+            } else {
+                ui.switch_sel = ui.switch_sel.saturating_sub(1);
+            }
+        }
         KeyCode::Down | KeyCode::Char('j') => {
-            if count > 0 {
+            if let Some(menu) = ui.upgrade_menu.as_mut() {
+                *menu = (*menu + 1).min(UPGRADE_ACTIONS.len() - 1);
+            } else if count > 0 {
                 ui.switch_sel = (ui.switch_sel + 1).min(count - 1);
             }
         }
         KeyCode::Enter => {
-            if let Some(sw) = selected_switch(ui) {
+            if let Some(menu) = ui.upgrade_menu {
+                activate_upgrade_action(ui, menu);
+            } else if let Some(sw) = selected_switch(ui) {
                 open_session_view(ui, sw);
             }
         }
         KeyCode::Char('r') => {
             if let Some(sw) = selected_switch(ui) {
-                if sw.submit(Job::Facts) {
+                if ui.app.switches.refresh_facts(sw.clone()) {
                     ui.status_msg = Some(format!("re-reading facts of {}", sw.display_name()));
                 }
             }
@@ -1254,7 +1919,6 @@ fn handle_switches_key(ui: &mut Ui, key: KeyEvent) {
             }
         }
         KeyCode::Char('y') => {
-            // Trust the host key of the selected session without opening it.
             if let Some(sw) = selected_switch(ui) {
                 if matches!(sw.state(), SwitchState::HostKey { .. }) {
                     sw.answer_host_key(true);
@@ -1264,7 +1928,6 @@ fn handle_switches_key(ui: &mut Ui, key: KeyEvent) {
         KeyCode::Char('X') => {
             ui.app.switches.forget_closed();
             ui.switch_sel = 0;
-            ui.status_msg = Some("closed sessions removed".into());
         }
         _ => {}
     }
@@ -1302,7 +1965,10 @@ fn handle_logs_key(ui: &mut Ui, key: KeyEvent) {
             });
         }
         KeyCode::Char('L') => {
-            let i = LogLevel::ALL.iter().position(|l| *l == ui.log_min_level).unwrap_or(0);
+            let i = LogLevel::ALL
+                .iter()
+                .position(|l| *l == ui.log_min_level)
+                .unwrap_or(0);
             ui.log_min_level = LogLevel::ALL[(i + 1) % LogLevel::ALL.len()];
         }
         KeyCode::Char('P') => {
@@ -1325,6 +1991,52 @@ fn handle_logs_key(ui: &mut Ui, key: KeyEvent) {
 fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
     let mut modal = ui.modal.take();
     match &mut modal {
+        Some(Modal::ConfirmStart { id }) => {
+            let id = *id;
+            ui.modal = Some(Modal::Deploy);
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                start_deploy_service(ui, id);
+                ui.pending_deploy = Some((id, Instant::now()));
+            }
+            return;
+        }
+        Some(Modal::DeployProtocol { selected }) => {
+            match key.code {
+                KeyCode::Up | KeyCode::Left => *selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Right => {
+                    *selected = (*selected + 1).min(DEPLOY_PROTOCOLS.len() - 1)
+                }
+                KeyCode::Char('s') => {
+                    let id = crate::cisco::service_of(DEPLOY_PROTOCOLS[*selected]);
+                    start_deploy_service(ui, id);
+                }
+                KeyCode::Enter => {
+                    if let Some(view) = ui.deploy.as_mut() {
+                        view.form.proto = DEPLOY_PROTOCOLS[*selected];
+                        if ui.deploy_mode == DeployMode::Copy {
+                            view.form.field = 6;
+                        } else {
+                            view.form.field = deploy_fields(ui.deploy_mode).len() - 1;
+                        }
+                        view.error = None;
+                    }
+                    ui.modal = Some(Modal::Deploy);
+                    return;
+                }
+                KeyCode::Esc => {
+                    ui.modal = Some(Modal::Deploy);
+                    return;
+                }
+                _ => {}
+            }
+            ui.modal = modal;
+            return;
+        }
+        Some(Modal::UpgradeFiles) => {
+            ui.modal = modal;
+            handle_upgrade_files_key(ui, key);
+            return;
+        }
         Some(Modal::Help) => match key.code {
             // The two key tables can be taller than the terminal.
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1391,7 +2103,12 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
                 return;
             }
         },
-        Some(Modal::Cisco { commands, selected, copied, .. }) => match key.code {
+        Some(Modal::Cisco {
+            commands,
+            selected,
+            copied,
+            ..
+        }) => match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 *selected = selected.saturating_sub(1);
                 *copied = false;
@@ -1427,7 +2144,9 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
                 let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
                 let keep_cwd = std::mem::replace(
                     &mut ui.files.cwd,
-                    rel.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default(),
+                    rel.rsplit_once('/')
+                        .map(|(d, _)| d.to_string())
+                        .unwrap_or_default(),
                 );
                 open_cisco_modal(ui, &name);
                 ui.files.cwd = keep_cwd;
@@ -1593,7 +2312,12 @@ fn activate_service_field(ui: &mut Ui, id: ServiceId, field: EditField) {
 
 /// Apply an edited service field from the popup. Returns an error message on
 /// failure (invalid value), otherwise `None`.
-fn commit_service_edit(ui: &mut Ui, id: ServiceId, field: EditField, value: String) -> Option<String> {
+fn commit_service_edit(
+    ui: &mut Ui,
+    id: ServiceId,
+    field: EditField,
+    value: String,
+) -> Option<String> {
     match field {
         EditField::Port => match value.trim().parse::<u16>() {
             Ok(port) if port > 0 => {
@@ -1623,7 +2347,11 @@ fn commit_service_edit(ui: &mut Ui, id: ServiceId, field: EditField, value: Stri
                 if ui.app.services.status(id).is_running() {
                     ui.app.services.restart(id);
                 }
-                ui.status_msg = Some(format!("{} bind set to {}", id.display_name(), value.trim()));
+                ui.status_msg = Some(format!(
+                    "{} bind set to {}",
+                    id.display_name(),
+                    value.trim()
+                ));
                 None
             }
             Err(_) => Some(format!("invalid bind address: {value}")),
@@ -1697,7 +2425,11 @@ fn apply_input(ui: &mut Ui, action: InputAction, value: String) {
                 if ui.app.services.status(id).is_running() {
                     ui.app.services.restart(id);
                 }
-                ui.status_msg = Some(format!("{} bind set to {}", id.display_name(), value.trim()));
+                ui.status_msg = Some(format!(
+                    "{} bind set to {}",
+                    id.display_name(),
+                    value.trim()
+                ));
             }
             Err(_) => {
                 ui.modal = Some(Modal::Message(format!(
@@ -1761,7 +2493,9 @@ fn restart_auth_services(ui: &mut Ui) {
             ui.app.services.restart(id);
         }
     }
-    ui.app.logger.log(Event::new(LogLevel::Info, "core", "credentials updated"));
+    ui.app
+        .logger
+        .log(Event::new(LogLevel::Info, "core", "credentials updated"));
 }
 
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
@@ -1782,6 +2516,22 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_import_accepts_mixed_separators_deduplicates_and_validates() {
+        assert_eq!(
+            bulk_hosts("10.0.0.1 10.0.0.2,10.0.0.3;10.0.0.4\n10.0.0.1\r\n2001:db8::1").unwrap(),
+            vec![
+                "10.0.0.1",
+                "10.0.0.2",
+                "10.0.0.3",
+                "10.0.0.4",
+                "2001:db8::1"
+            ]
+        );
+        assert!(bulk_hosts(" ;,\n").is_err());
+        assert!(bulk_hosts("10.0.0.1;invalid;10.0.0.2").is_err());
+    }
 
     #[test]
     fn hashes_of_known_content() {
@@ -1819,7 +2569,15 @@ mod tests {
             redact_url_password("copy ftp://cisco:cisco123@10.0.0.1/img.bin flash:"),
             "copy ftp://cisco:***@10.0.0.1/img.bin flash:"
         );
-        // Nothing to hide in the other schemes.
+        for scheme in ["scp", "sftp"] {
+            assert_eq!(
+                redact_url_password(&format!(
+                    "copy {scheme}://cisco:secret@10.0.0.1/img.bin flash:"
+                )),
+                format!("copy {scheme}://cisco:***@10.0.0.1/img.bin flash:")
+            );
+        }
+        // URLs without credentials are unchanged.
         let plain = "copy http://10.0.0.1:8080/img.bin flash:";
         assert_eq!(redact_url_password(plain), plain);
         let scp = "copy scp://cisco@10.0.0.1/img.bin flash:";
@@ -1851,6 +2609,9 @@ mod tests {
         // Not a recognised length.
         assert_eq!(compare_hash(&i, "deadbeef").kind, "?");
         // Non-hex characters.
-        assert_eq!(compare_hash(&i, "zz0150983cd24fb0d6963f7d28e17f72").kind, "?");
+        assert_eq!(
+            compare_hash(&i, "zz0150983cd24fb0d6963f7d28e17f72").kind,
+            "?"
+        );
     }
 }

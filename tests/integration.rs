@@ -79,7 +79,21 @@ impl Server {
         stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
+        // Read the declared HTTP response, rather than waiting for socket EOF.
+        // macOS can reset a rejected upload with an unread request body after
+        // sending the complete response; its Content-Length still frames it.
+        while !response.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            response.push(byte[0]);
+            assert!(response.len() < 16 * 1024, "HTTP headers too large");
+        }
+        let body_start = response.len();
+        let content_length = String::from_utf8_lossy(&response).lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .unwrap().parse::<usize>().unwrap();
+        response.resize(body_start + content_length, 0);
+        stream.read_exact(&mut response[body_start..]).unwrap();
         let head = String::from_utf8_lossy(&response);
         let code: u16 = head
             .split_whitespace()

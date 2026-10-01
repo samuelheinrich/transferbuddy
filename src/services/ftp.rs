@@ -425,7 +425,12 @@ impl<'a> Conn<'a> {
                 self.reply(150, &format!("opening data connection ({size} bytes)")).await?;
                 s
             }
-            Err(e) => return self.reply(425, &e).await,
+            Err(e) => {
+                self.ctx
+                    .sessions
+                    .finish(self.sid, SessionState::Failed(e.clone()));
+                return self.reply(425, &e).await;
+            }
         };
         let start = Instant::now();
         let mut file = tokio::fs::File::open(&abs).await.map_err(|e| e.to_string())?;
@@ -443,7 +448,14 @@ impl<'a> Conn<'a> {
             self.handle.add_bytes(n as u64);
         }
         data.shutdown().await.ok();
-        self.ctx.sessions.update(self.sid, |s| s.state = SessionState::Connected);
+        self.ctx.sessions.finish(
+            self.sid,
+            if ok {
+                SessionState::Completed
+            } else {
+                SessionState::Aborted
+            },
+        );
         if ok {
             self.ctx.logger.log(
                 Event::new(LogLevel::Info, "ftp", "download")
@@ -488,7 +500,12 @@ impl<'a> Conn<'a> {
                 self.reply(150, "ready to receive").await?;
                 s
             }
-            Err(e) => return self.reply(425, &e).await,
+            Err(e) => {
+                self.ctx
+                    .sessions
+                    .finish(self.sid, SessionState::Failed(e.clone()));
+                return self.reply(425, &e).await;
+            }
         };
         let start = Instant::now();
         let mut file = guard.file.take().expect("fresh upload guard has a file");
@@ -510,12 +527,12 @@ impl<'a> Conn<'a> {
                 break Err("upload size limit exceeded".into());
             }
         };
-        self.ctx.sessions.update(self.sid, |s| s.state = SessionState::Connected);
         match result {
             Ok(()) => {
                 guard.file = Some(file);
                 match guard.finalize().await {
                     Ok(final_rel) => {
+                        self.ctx.sessions.finish(self.sid, SessionState::Completed);
                         self.ctx.logger.log(
                             Event::new(LogLevel::Info, "ftp", "upload")
                                 .ip(self.peer.ip())
@@ -527,10 +544,18 @@ impl<'a> Conn<'a> {
                         );
                         self.reply(226, "transfer complete").await
                     }
-                    Err(e) => self.reply(550, &e).await,
+                    Err(e) => {
+                        self.ctx
+                            .sessions
+                            .finish(self.sid, SessionState::Failed(e.clone()));
+                        self.reply(550, &e).await
+                    }
                 }
             }
             Err(e) => {
+                self.ctx
+                    .sessions
+                    .finish(self.sid, SessionState::Failed(e.clone()));
                 self.ctx.logger.log(
                     Event::new(LogLevel::Warning, "ftp", "upload")
                         .ip(self.peer.ip())

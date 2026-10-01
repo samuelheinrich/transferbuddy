@@ -76,11 +76,13 @@ impl SessionState {
 pub struct SessionHandle {
     pub id: u64,
     pub bytes: AtomicU64,
+    last_byte: Mutex<Option<Instant>>,
 }
 
 impl SessionHandle {
     pub fn add_bytes(&self, n: u64) {
         self.bytes.fetch_add(n, Ordering::Relaxed);
+        *self.last_byte.lock().unwrap() = Some(Instant::now());
     }
 }
 
@@ -99,13 +101,19 @@ pub struct SessionInfo {
     pub started_wall: SystemTime,
     pub started: Instant,
     pub ended: Option<Instant>,
+    /// Transfer timing is independent of a persistent FTP/SSH connection.
+    pub transfer_started: Option<Instant>,
+    pub transfer_ended: Option<Instant>,
     /// Bytes/sec over the last sampling window.
     pub current_speed: f64,
 }
 
 impl SessionInfo {
     pub fn duration(&self) -> Duration {
-        self.ended.unwrap_or_else(Instant::now).duration_since(self.started)
+        self.transfer_ended
+            .or(self.ended)
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(self.transfer_started.unwrap_or(self.started))
     }
     pub fn avg_speed(&self) -> f64 {
         let secs = self.duration().as_secs_f64();
@@ -183,13 +191,24 @@ impl SessionManager {
         });
         for r in records.values_mut() {
             let bytes = r.handle.bytes.load(Ordering::Relaxed);
+            if r.info.transfer_ended.is_none() && r.info.total.is_some_and(|t| bytes >= t) {
+                r.info.transfer_ended = *r.handle.last_byte.lock().unwrap();
+            }
             let (t0, b0) = r.last_sample;
             let dt = now.duration_since(t0).as_secs_f64();
             if dt > 0.05 {
-                r.info.current_speed = (bytes.saturating_sub(b0)) as f64 / dt;
+                r.info.current_speed = if r.info.transfer_ended.is_some() || r.info.ended.is_some()
+                {
+                    0.0
+                } else {
+                    (bytes.saturating_sub(b0)) as f64 / dt
+                };
                 r.last_sample = (now, bytes);
             }
             r.info.bytes = bytes;
+            if r.info.transfer_ended.is_some() || r.info.ended.is_some() {
+                r.info.current_speed = 0.0;
+            }
         }
     }
 
@@ -200,7 +219,11 @@ impl SessionManager {
         local_port: u16,
     ) -> Arc<SessionHandle> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let handle = Arc::new(SessionHandle { id, bytes: AtomicU64::new(0) });
+        let handle = Arc::new(SessionHandle {
+            id,
+            bytes: AtomicU64::new(0),
+            last_byte: Mutex::new(None),
+        });
         let info = SessionInfo {
             id,
             protocol,
@@ -215,6 +238,8 @@ impl SessionManager {
             started_wall: SystemTime::now(),
             started: Instant::now(),
             ended: None,
+            transfer_started: None,
+            transfer_ended: None,
             current_speed: 0.0,
         };
         self.records.lock().unwrap().insert(
@@ -226,25 +251,59 @@ impl SessionManager {
 
     pub fn update<F: FnOnce(&mut SessionInfo)>(&self, id: u64, f: F) {
         if let Some(r) = self.records.lock().unwrap().get_mut(&id) {
+            let was_transfer = r.info.state == SessionState::Transferring;
             f(&mut r.info);
+            if !was_transfer && r.info.state == SessionState::Transferring {
+                let now = Instant::now();
+                r.handle.bytes.store(0, Ordering::Relaxed);
+                *r.handle.last_byte.lock().unwrap() = None;
+                r.info.bytes = 0;
+                r.info.current_speed = 0.0;
+                r.info.ended = None;
+                r.info.transfer_started = Some(now);
+                r.info.transfer_ended = None;
+                r.last_sample = (now, 0);
+            } else if was_transfer && r.info.state != SessionState::Transferring {
+                // Adapters used to return to Connected after a copy, leaving
+                // the transfer's duration growing while the connection idled.
+                if r.info.state == SessionState::Connected {
+                    r.info.state = SessionState::Completed;
+                }
+                self.finish_record(r);
+            }
         }
     }
 
-    /// Mark a session finished; `Completed` transfers are added to the totals.
+    fn finish_record(&self, r: &mut SessionRecord) {
+        r.info.bytes = r.handle.bytes.load(Ordering::Relaxed);
+        r.info.transfer_ended = r
+            .info
+            .transfer_ended
+            .or(*r.handle.last_byte.lock().unwrap())
+            .or(Some(Instant::now()));
+        r.info.current_speed = 0.0;
+        let mut totals = self.totals.lock().unwrap();
+        totals.total_bytes += r.info.bytes;
+        if r.info.state == SessionState::Completed && r.info.file.is_some() {
+            totals.completed_transfers += 1;
+        }
+    }
+
+    pub fn finish(&self, id: u64, state: SessionState) {
+        self.update(id, |s| s.state = state);
+    }
+
+    /// Close the connection without changing an already completed transfer.
     pub fn close(&self, id: u64, state: SessionState) {
         let mut records = self.records.lock().unwrap();
         if let Some(r) = records.get_mut(&id) {
             if r.info.ended.is_none() {
-                r.info.bytes = r.handle.bytes.load(Ordering::Relaxed);
+                if r.info.state == SessionState::Transferring || r.info.transfer_started.is_none() {
+                    r.info.state = state;
+                    self.finish_record(r);
+                }
                 r.info.ended = Some(Instant::now());
                 r.info.current_speed = 0.0;
-                let was_transfer = r.info.file.is_some();
-                r.info.state = state.clone();
-                let mut totals = self.totals.lock().unwrap();
-                totals.total_bytes += r.info.bytes;
-                if state == SessionState::Completed && was_transfer {
-                    totals.completed_transfers += 1;
-                }
             }
         }
     }
@@ -383,6 +442,62 @@ mod tests {
         let (completed, bytes) = mgr.totals();
         assert_eq!(completed, 1);
         assert_eq!(bytes, 1000);
+    }
+
+    #[test]
+    fn completed_transfer_stops_timing_even_with_connection_open() {
+        let mgr = SessionManager::new(600);
+        let h = mgr.open(Protocol::Ftp, peer(), 2121);
+        // A connection can be idle for a long time before its first RETR.
+        mgr.update(h.id, |s| {
+            s.started = Instant::now() - Duration::from_secs(60)
+        });
+        mgr.update(h.id, |s| {
+            s.file = Some("one.bin".into());
+            s.total = Some(1000);
+            s.state = SessionState::Transferring;
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        h.add_bytes(1000);
+        mgr.sample();
+        let completed = mgr.snapshot()[0].clone();
+        assert_eq!(completed.progress(), Some(1.0));
+        assert!(completed.duration() < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(60));
+        mgr.sample();
+        let idle = mgr.snapshot()[0].clone();
+        assert_eq!(idle.duration(), completed.duration());
+        assert_eq!(idle.avg_speed(), completed.avg_speed());
+        assert_eq!(idle.current_speed, 0.0);
+        assert_eq!(idle.eta(), None);
+        // Finishing the data transfer must not wait for FTP QUIT / SSH close.
+        mgr.finish(h.id, SessionState::Completed);
+        assert_eq!(mgr.active_count(), 0);
+        assert_eq!(mgr.totals(), (1, 1000));
+        mgr.close(h.id, SessionState::Completed);
+        assert_eq!(mgr.totals(), (1, 1000));
+    }
+
+    #[test]
+    fn persistent_connection_resets_metrics_for_each_transfer() {
+        let mgr = SessionManager::new(600);
+        let h = mgr.open(Protocol::Sftp, peer(), 2222);
+        for (file, bytes) in [("one.bin", 1000), ("two.bin", 2000)] {
+            mgr.update(h.id, |s| {
+                s.file = Some(file.into());
+                s.total = Some(bytes);
+                s.state = SessionState::Transferring;
+            });
+            assert_eq!(mgr.snapshot()[0].bytes, 0);
+            assert_eq!(h.bytes.load(Ordering::Relaxed), 0);
+            assert_eq!(mgr.snapshot()[0].transfer_ended, None);
+            h.add_bytes(bytes);
+            mgr.finish(h.id, SessionState::Completed);
+            assert_eq!(mgr.snapshot()[0].bytes, bytes);
+            assert_eq!(mgr.snapshot()[0].progress(), Some(1.0));
+        }
+        mgr.close(h.id, SessionState::Completed);
+        assert_eq!(mgr.totals(), (2, 3000));
     }
 
     #[test]

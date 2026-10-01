@@ -18,11 +18,12 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use russh::client::{self, KeyboardInteractiveAuthResponse};
 use russh::ChannelMsg;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use crate::cisco::{FlashUsage, VersionInfo};
 use crate::deploy::{self, PromptAction, Wire};
 use crate::logging::{Event, LogLevel, Logger};
+use crate::session::{Protocol, SessionInfo, SessionManager};
 
 /// Timeouts. A `copy` of a 500 MB image over TFTP can genuinely take an hour.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -34,6 +35,61 @@ const TRANSCRIPT_MAX: usize = 2000;
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// How long an unanswered host key question keeps a session waiting.
 const HOST_KEY_TIMEOUT: Duration = Duration::from_secs(120);
+static KNOWN_HOSTS_WRITE: Mutex<()> = Mutex::new(());
+
+fn same_host(a: &str, b: &str) -> bool {
+    match (a.parse::<std::net::IpAddr>(), b.parse::<std::net::IpAddr>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(b.trim_end_matches('.')),
+    }
+}
+
+/// IPv4 host range; /31 and /32 have no excluded network/broadcast address.
+pub fn subnet_hosts(cidr: &str) -> Result<Vec<String>, String> {
+    let (address, prefix) = cidr
+        .trim()
+        .split_once('/')
+        .ok_or("enter an IPv4 subnet, e.g. 192.168.10.0/24")?;
+    let ip: std::net::Ipv4Addr = address.parse().map_err(|_| "invalid IPv4 subnet address")?;
+    let prefix: u32 = prefix.parse().map_err(|_| "invalid subnet prefix")?;
+    if !(16..=32).contains(&prefix) {
+        return Err("experimental scan supports IPv4 /16 through /32".into());
+    }
+    let count = 1u64 << (32 - prefix);
+    let network = u64::from(u32::from(ip)) & !(count - 1);
+    let skip = u64::from(prefix < 31);
+    Ok((network + skip..network + count - skip)
+        .map(|ip| std::net::Ipv4Addr::from(ip as u32).to_string())
+        .collect())
+}
+
+#[derive(Clone, Default)]
+pub struct ScanProgress {
+    pub subnet: String,
+    pub total: usize,
+    pub checked: usize,
+    pub reachable: usize,
+    pub last_host: String,
+    pub finished: bool,
+    pub cancelled: bool,
+    pub error: Option<String>,
+}
+
+pub struct SubnetScan {
+    progress: Mutex<ScanProgress>,
+    cancel: AtomicBool,
+}
+
+impl SubnetScan {
+    pub fn progress(&self) -> ScanProgress {
+        self.progress.lock().unwrap().clone()
+    }
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
 
 /// Everything needed to open a session.
 #[derive(Debug, Clone)]
@@ -44,6 +100,8 @@ pub struct Target {
     pub password: String,
     pub enable_password: String,
     pub known_hosts: PathBuf,
+    /// Bulk import and subnet discovery explicitly trust replacement keys.
+    pub auto_trust: bool,
 }
 
 /// Work handed to an open session.
@@ -51,6 +109,7 @@ pub struct Target {
 pub enum Job {
     /// Re-read `dir` and `show version`.
     Facts,
+    RemoveInactive,
     /// Let the device pull one file.
     Copy {
         rel_path: String,
@@ -65,6 +124,7 @@ impl Job {
     fn label(&self) -> String {
         match self {
             Job::Facts => "reading device facts".into(),
+            Job::RemoveInactive => "install remove inactive".into(),
             Job::Copy { rel_path, .. } => format!("copying {rel_path}"),
             Job::Disconnect => "disconnecting".into(),
         }
@@ -75,15 +135,27 @@ impl Job {
 pub enum SwitchState {
     Connecting,
     /// Waiting for the user to accept an unknown host key.
-    HostKey { fingerprint: String },
+    HostKey {
+        fingerprint: String,
+    },
+    CleanupConfirm {
+        files: Vec<String>,
+        warning: Option<String>,
+    },
     /// Logged in, privileged, idle.
     Ready,
-    Busy { what: String },
+    Busy {
+        what: String,
+    },
     /// The session is gone but the device may come back — this is the state a
     /// reload leaves behind.
-    Offline { reason: String },
+    Offline {
+        reason: String,
+    },
     /// The session never came up.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
     /// Closed on purpose.
     Closed,
 }
@@ -93,6 +165,7 @@ impl SwitchState {
         match self {
             SwitchState::Connecting => "connecting",
             SwitchState::HostKey { .. } => "host key?",
+            SwitchState::CleanupConfirm { .. } => "cleanup?",
             SwitchState::Ready => "ready",
             SwitchState::Busy { .. } => "busy",
             SwitchState::Offline { .. } => "offline",
@@ -101,7 +174,10 @@ impl SwitchState {
         }
     }
     pub fn is_live(&self) -> bool {
-        matches!(self, SwitchState::Ready | SwitchState::Busy { .. })
+        matches!(
+            self,
+            SwitchState::Ready | SwitchState::Busy { .. } | SwitchState::CleanupConfirm { .. }
+        )
     }
     pub fn is_over(&self) -> bool {
         matches!(
@@ -149,6 +225,17 @@ pub struct Line {
     pub text: String,
 }
 
+/// One explicitly requested copy, correlated with the file server's counters.
+#[derive(Clone)]
+pub struct Transfer {
+    pub rel_path: String,
+    pub size: u64,
+    pub protocol: Protocol,
+    pub started: Instant,
+    pub ended: Option<Instant>,
+    pub session: Option<SessionInfo>,
+}
+
 /// One open session to one device.
 pub struct Switch {
     pub id: u64,
@@ -156,6 +243,11 @@ pub struct Switch {
     pub port: u16,
     pub username: String,
     pub opened: Instant,
+    target: Option<Target>,
+    protocol: Mutex<Protocol>,
+    transfer: Mutex<Option<Transfer>>,
+    peer_ips: Mutex<Vec<std::net::IpAddr>>,
+    refreshing: AtomicBool,
     state: Mutex<SwitchState>,
     facts: Mutex<Facts>,
     transcript: Mutex<VecDeque<Line>>,
@@ -165,6 +257,7 @@ pub struct Switch {
     /// Result of the last finished job, for the UI.
     last_result: Mutex<Option<std::result::Result<String, String>>>,
     host_key_reply: Mutex<Option<oneshot::Sender<bool>>>,
+    cleanup_reply: Mutex<Option<oneshot::Sender<bool>>>,
     /// Number of finished jobs, so the UI can announce each one once.
     jobs_done: AtomicU64,
     jobs: mpsc::UnboundedSender<Job>,
@@ -172,6 +265,53 @@ pub struct Switch {
 }
 
 impl Switch {
+    pub fn protocol(&self) -> Protocol {
+        *self.protocol.lock().unwrap()
+    }
+    pub fn set_protocol(&self, protocol: Protocol) {
+        *self.protocol.lock().unwrap() = protocol;
+    }
+    pub fn begin_transfer(&self, rel_path: String, size: u64, protocol: Protocol) {
+        self.set_protocol(protocol);
+        *self.transfer.lock().unwrap() = Some(Transfer {
+            rel_path,
+            size,
+            protocol,
+            started: Instant::now(),
+            ended: None,
+            session: None,
+        });
+    }
+    pub fn transfer(&self, sessions: &SessionManager) -> Option<Transfer> {
+        let mut guard = self.transfer.lock().unwrap();
+        let transfer = guard.as_mut()?;
+        let ips = self.peer_ips.lock().unwrap();
+        if let Some(session) = sessions
+            .snapshot()
+            .into_iter()
+            .filter(|s| {
+                s.protocol == transfer.protocol
+                    && s.direction == Some(crate::session::Direction::Download)
+                    && s.file.as_deref().map(|f| f.trim_start_matches('/'))
+                        == Some(transfer.rel_path.as_str())
+                    && s.transfer_started.unwrap_or(s.started) >= transfer.started
+                    && transfer
+                        .ended
+                        .is_none_or(|end| s.transfer_started.unwrap_or(s.started) <= end)
+                    && (ips.contains(&s.peer.ip())
+                        || self.host.parse::<std::net::IpAddr>().ok() == Some(s.peer.ip()))
+            })
+            .max_by_key(|s| s.transfer_started.unwrap_or(s.started))
+        {
+            let mut session = session;
+            if let Some(end) = transfer.ended {
+                session.transfer_ended = session.transfer_ended.or(Some(end));
+                session.current_speed = 0.0;
+            }
+            transfer.session = Some(session);
+        }
+        Some(transfer.clone())
+    }
     pub fn state(&self) -> SwitchState {
         self.state.lock().unwrap().clone()
     }
@@ -218,11 +358,18 @@ impl Switch {
         self.cancel.store(true, Ordering::Relaxed);
         // A pending host key question would otherwise keep the driver parked.
         self.answer_host_key(false);
+        self.answer_cleanup(false);
     }
 
     /// Answer the pending host key question.
     pub fn answer_host_key(&self, accept: bool) {
         if let Some(tx) = self.host_key_reply.lock().unwrap().take() {
+            let _ = tx.send(accept);
+        }
+    }
+
+    pub fn answer_cleanup(&self, accept: bool) {
+        if let Some(tx) = self.cleanup_reply.lock().unwrap().take() {
             let _ = tx.send(accept);
         }
     }
@@ -233,7 +380,9 @@ impl Switch {
     pub fn for_test_host_key(fingerprint: &str) -> (Arc<Self>, oneshot::Receiver<bool>) {
         let switch = Self::for_test(
             "10.20.30.40",
-            SwitchState::HostKey { fingerprint: fingerprint.to_string() },
+            SwitchState::HostKey {
+                fingerprint: fingerprint.to_string(),
+            },
             Facts::default(),
             Vec::new(),
         );
@@ -242,9 +391,30 @@ impl Switch {
         (switch, rx)
     }
 
+    #[cfg(test)]
+    pub fn for_test_cleanup() -> (Arc<Self>, oneshot::Receiver<bool>) {
+        let switch = Self::for_test(
+            "10.20.30.40",
+            SwitchState::CleanupConfirm {
+                files: vec!["/flash/cat9k_lite_iosxe.17.12.06.SPA.bin".into()],
+                warning: Some("DANGER: deletion list contains the RUNNING IOS 17.12.06".into()),
+            },
+            Facts::default(),
+            Vec::new(),
+        );
+        let (tx, rx) = oneshot::channel();
+        *switch.cleanup_reply.lock().unwrap() = Some(tx);
+        (switch, rx)
+    }
+
     /// A detached session with a fixed state, for rendering tests.
     #[cfg(test)]
-    pub fn for_test(host: &str, state: SwitchState, facts: Facts, transcript: Vec<Line>) -> Arc<Self> {
+    pub fn for_test(
+        host: &str,
+        state: SwitchState,
+        facts: Facts,
+        transcript: Vec<Line>,
+    ) -> Arc<Self> {
         let (tx, _rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             id: 1,
@@ -252,6 +422,11 @@ impl Switch {
             port: 22,
             username: "netadmin".into(),
             opened: Instant::now(),
+            target: None,
+            protocol: Mutex::new(Protocol::Http),
+            transfer: Mutex::new(None),
+            peer_ips: Mutex::new(Vec::new()),
+            refreshing: AtomicBool::new(false),
             state: Mutex::new(state),
             facts: Mutex::new(facts),
             transcript: Mutex::new(transcript.into()),
@@ -264,6 +439,7 @@ impl Switch {
             }),
             last_result: Mutex::new(None),
             host_key_reply: Mutex::new(None),
+            cleanup_reply: Mutex::new(None),
             jobs_done: AtomicU64::new(0),
             jobs: tx,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -282,7 +458,10 @@ impl Switch {
 
     fn push(&self, kind: LineKind, text: impl Into<String>) {
         let mut t = self.transcript.lock().unwrap();
-        t.push_back(Line { kind, text: text.into() });
+        t.push_back(Line {
+            kind,
+            text: text.into(),
+        });
         while t.len() > TRANSCRIPT_MAX {
             t.pop_front();
         }
@@ -290,20 +469,76 @@ impl Switch {
 }
 
 /// Every open session, plus the runtime to drive them.
+#[derive(Clone)]
 pub struct SwitchManager {
-    switches: Mutex<Vec<Arc<Switch>>>,
+    switches: Arc<Mutex<Vec<Arc<Switch>>>>,
     runtime: tokio::runtime::Handle,
     logger: Arc<Logger>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
+    connect_slots: Arc<Semaphore>,
+    scan: Arc<Mutex<Option<Arc<SubnetScan>>>>,
 }
 
 impl SwitchManager {
+    pub fn scan(&self) -> Option<Arc<SubnetScan>> {
+        self.scan.lock().unwrap().clone()
+    }
+
+    pub fn start_scan(&self, target: Target, cidr: &str, protocol: Protocol) -> Result<(), String> {
+        self.start_scan_with_probe(target, cidr, protocol, |host| async move {
+            ping_probe(&host)
+                .await
+                .map(|rtt| rtt.is_some())
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn start_scan_with_probe<F, Fut>(
+        &self,
+        target: Target,
+        cidr: &str,
+        protocol: Protocol,
+        probe: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(String) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Result<bool, String>> + Send + 'static,
+    {
+        let hosts = subnet_hosts(cidr)?;
+        let mut current = self.scan.lock().unwrap();
+        if current.as_ref().is_some_and(|s| !s.progress().finished) {
+            return Err("a subnet scan is already running (S cancels it)".into());
+        }
+        let scan = Arc::new(SubnetScan {
+            progress: Mutex::new(ScanProgress {
+                subnet: cidr.trim().into(),
+                total: hosts.len(),
+                ..Default::default()
+            }),
+            cancel: AtomicBool::new(false),
+        });
+        *current = Some(scan.clone());
+        let manager = self.clone();
+        self.runtime.spawn(async move {
+            sweep_subnet(hosts, scan, probe, move |host| {
+                let mut target = target.clone();
+                target.host = host;
+                target.auto_trust = true;
+                manager.connect(target).set_protocol(protocol);
+            })
+            .await;
+        });
+        Ok(())
+    }
+
     pub fn new(runtime: tokio::runtime::Handle, logger: Arc<Logger>) -> Self {
         Self {
-            switches: Mutex::new(Vec::new()),
+            switches: Arc::new(Mutex::new(Vec::new())),
             runtime,
             logger,
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
+            connect_slots: Arc::new(Semaphore::new(16)),
+            scan: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -312,7 +547,12 @@ impl SwitchManager {
     }
 
     pub fn get(&self, id: u64) -> Option<Arc<Switch>> {
-        self.switches.lock().unwrap().iter().find(|s| s.id == id).cloned()
+        self.switches
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.id == id)
+            .cloned()
     }
 
     /// An existing, usable session for the same device and user.
@@ -322,14 +562,20 @@ impl SwitchManager {
             .unwrap()
             .iter()
             .find(|s| {
-                s.host == host && s.port == port && s.username == username && !s.state().is_over()
+                same_host(&s.host, host)
+                    && s.port == port
+                    && s.username == username
+                    && !s.state().is_over()
             })
             .cloned()
     }
 
     /// Drop finished sessions from the list.
     pub fn forget_closed(&self) {
-        self.switches.lock().unwrap().retain(|s| !s.state().is_over());
+        self.switches
+            .lock()
+            .unwrap()
+            .retain(|s| !s.state().is_over());
     }
 
     pub fn forget(&self, id: u64) {
@@ -342,8 +588,61 @@ impl SwitchManager {
         }
     }
 
+    /// A busy copy owns its console. Read facts on a second SSH connection.
+    pub fn refresh_facts(&self, switch: Arc<Switch>) -> bool {
+        if !matches!(
+            switch.state(),
+            SwitchState::Busy { .. } | SwitchState::CleanupConfirm { .. }
+        ) {
+            return switch.submit(Job::Facts);
+        }
+        let Some(target) = switch.target.clone() else {
+            return false;
+        };
+        if switch.refreshing.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        let logger = self.logger.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut shell = open_shell(&switch, &target, false).await?;
+                collect_facts(&switch, &mut shell).await?;
+                shell.channel.close().await?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(e) = result {
+                logger.log(
+                    Event::new(LogLevel::Warning, "switch", "refresh on second SSH session")
+                        .error(format!("{e:#}")),
+                );
+                switch.push(LineKind::Error, format!("refresh failed: {e:#}"));
+            }
+            switch.refreshing.store(false, Ordering::Relaxed);
+        });
+        true
+    }
+
     /// Open a session and start the driver and the ping monitor.
     pub fn connect(&self, target: Target) -> Arc<Switch> {
+        let mut switches = self.switches.lock().unwrap();
+        if let Some(existing) = switches
+            .iter()
+            .find(|s| same_host(&s.host, &target.host) && s.port == target.port)
+        {
+            if !existing.state().is_over() {
+                return existing.clone();
+            }
+        }
+        // Reconnecting replaces a finished row, including failed bulk attempts.
+        switches.retain(|s| {
+            if same_host(&s.host, &target.host) && s.port == target.port {
+                s.cancel(); // Stop the old row's offline ping monitor, too.
+                false
+            } else {
+                true
+            }
+        });
         let (tx, rx) = mpsc::unbounded_channel();
         let switch = Arc::new(Switch {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
@@ -351,24 +650,106 @@ impl SwitchManager {
             port: target.port,
             username: target.username.clone(),
             opened: Instant::now(),
+            target: Some(target.clone()),
+            protocol: Mutex::new(Protocol::Http),
+            transfer: Mutex::new(None),
+            peer_ips: Mutex::new(Vec::new()),
+            refreshing: AtomicBool::new(false),
             state: Mutex::new(SwitchState::Connecting),
-            facts: Mutex::new(Facts { flash_device: "flash:".into(), ..Facts::default() }),
+            facts: Mutex::new(Facts {
+                flash_device: "flash:".into(),
+                ..Facts::default()
+            }),
             transcript: Mutex::new(VecDeque::new()),
             live: Mutex::new(String::new()),
             reach: Mutex::new(Reach::default()),
             last_result: Mutex::new(None),
             host_key_reply: Mutex::new(None),
+            cleanup_reply: Mutex::new(None),
             jobs_done: AtomicU64::new(0),
             jobs: tx,
             cancel: Arc::new(AtomicBool::new(false)),
         });
-        self.switches.lock().unwrap().push(switch.clone());
+        switches.push(switch.clone());
+        drop(switches);
 
         let logger = self.logger.clone();
-        self.runtime.spawn(drive(switch.clone(), target, rx, logger));
+        let slots = self.connect_slots.clone();
+        let session = switch.clone();
+        self.runtime.spawn(async move {
+            let permit = tokio::select! {
+                permit = slots.acquire_owned() => permit.ok(),
+                _ = cancelled(&session) => None,
+            };
+            if let Some(permit) = permit {
+                drive(session, target, rx, logger, permit).await;
+            } else {
+                session.set_state(SwitchState::Closed);
+            }
+        });
         self.runtime.spawn(monitor_reachability(switch.clone()));
         switch
     }
+}
+
+/// Keep slow or missing replies off the UI thread and bound OS process usage.
+async fn sweep_subnet<F, Fut>(
+    hosts: Vec<String>,
+    scan: Arc<SubnetScan>,
+    probe: F,
+    on_reachable: impl Fn(String) + Send,
+) where
+    F: Fn(String) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<bool, String>> + Send + 'static,
+{
+    let mut hosts = hosts.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        if scan.cancel.load(Ordering::Relaxed) {
+            tasks.abort_all();
+            break;
+        }
+        while tasks.len() < 32 {
+            let Some(host) = hosts.next() else { break };
+            let probe = probe.clone();
+            tasks.spawn(async move {
+                let result = probe(host.clone()).await;
+                (host, result)
+            });
+        }
+        if tasks.is_empty() {
+            break;
+        }
+        let result = tokio::select! {
+            result = tasks.join_next() => result,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => continue,
+        };
+        match result {
+            Some(Ok((host, result))) => {
+                let mut progress = scan.progress.lock().unwrap();
+                progress.checked += 1;
+                progress.last_host = host.clone();
+                match result {
+                    Ok(true) => {
+                        progress.reachable += 1;
+                        drop(progress);
+                        on_reachable(host);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        progress.error = Some(error);
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                scan.progress.lock().unwrap().error = Some(e.to_string());
+            }
+            None => break,
+        }
+    }
+    let mut progress = scan.progress.lock().unwrap();
+    progress.cancelled = scan.cancel.load(Ordering::Relaxed);
+    progress.finished = true;
 }
 
 // ---------------------------------------------------------------- driver
@@ -378,6 +759,7 @@ async fn drive(
     target: Target,
     mut jobs: mpsc::UnboundedReceiver<Job>,
     logger: Arc<Logger>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let log = |level: LogLevel, action: String, detail: Option<String>| {
         let mut ev = Event::new(level, "switch", action);
@@ -390,11 +772,17 @@ async fn drive(
         logger.log(ev);
     };
 
-    switch.push(LineKind::Info, format!("connecting to {}:{}", target.host, target.port));
+    if let Ok(addresses) = tokio::net::lookup_host((target.host.as_str(), target.port)).await {
+        *switch.peer_ips.lock().unwrap() = addresses.map(|a| a.ip()).collect();
+    }
+    switch.push(
+        LineKind::Info,
+        format!("connecting to {}:{}", target.host, target.port),
+    );
     // Connecting must stay abortable: a device that never answers, or a host
     // key question nobody wants to answer, must not park the session forever.
     let opened = tokio::select! {
-        result = open_shell(&switch, &target) => result,
+        result = open_shell(&switch, &target, true) => result,
         _ = cancelled(&switch) => Err(anyhow!("cancelled before the session was up")),
     };
     let mut shell = match opened {
@@ -402,13 +790,24 @@ async fn drive(
         Err(e) => {
             let reason = format!("{e:#}");
             switch.push(LineKind::Error, reason.clone());
-            switch.set_state(SwitchState::Failed { reason: reason.clone() });
-            log(LogLevel::Error, format!("connect to {} failed", target.host), Some(reason));
+            switch.set_state(SwitchState::Failed {
+                reason: reason.clone(),
+            });
+            log(
+                LogLevel::Error,
+                format!("connect to {} failed", target.host),
+                Some(reason),
+            );
             return;
         }
     };
     switch.set_state(SwitchState::Ready);
-    log(LogLevel::Info, format!("connected to {}", switch.display_name()), None);
+    drop(permit);
+    log(
+        LogLevel::Info,
+        format!("connected to {}", switch.display_name()),
+        None,
+    );
 
     // Facts first, so a session is useful the moment it appears in the list.
     let _ = switch.submit(Job::Facts);
@@ -436,7 +835,11 @@ async fn drive(
             let _ = shell.send("exit", Wire::Command).await;
             let _ = shell.channel.close().await;
             switch.set_state(SwitchState::Closed);
-            log(LogLevel::Info, format!("disconnected from {}", switch.display_name()), None);
+            log(
+                LogLevel::Info,
+                format!("disconnected from {}", switch.display_name()),
+                None,
+            );
             return;
         }
 
@@ -459,15 +862,22 @@ async fn drive(
             }
         }
         if !matches!(job, Job::Facts) {
-            *switch.last_result.lock().unwrap() =
-                Some(outcome.as_ref().map(|s| s.clone()).map_err(|e| format!("{e:#}")));
+            *switch.last_result.lock().unwrap() = Some(
+                outcome
+                    .as_ref()
+                    .map(|s| s.clone())
+                    .map_err(|e| format!("{e:#}")),
+            );
             switch.jobs_done.fetch_add(1, Ordering::Relaxed);
         }
 
         // A broken session cannot be reused — say so instead of looking idle.
         if let Err(e) = &outcome {
             let text = format!("{e:#}");
-            if text.contains("closed the session") || text.contains("cancelled") {
+            if text.contains("closed the session")
+                || text.contains("cancelled")
+                || matches!(job, Job::RemoveInactive)
+            {
                 let _ = shell.channel.close().await;
                 switch.set_state(SwitchState::Offline { reason: text });
                 return;
@@ -491,8 +901,20 @@ async fn run_job(switch: &Arc<Switch>, shell: &mut Shell, job: &Job) -> Result<S
             collect_facts(switch, shell).await?;
             Ok(String::new())
         }
-        Job::Copy { command, overwrite, .. } => {
-            let summary = run_copy(shell, command, *overwrite).await?;
+        Job::RemoveInactive => {
+            collect_facts(switch, shell).await?;
+            let summary = run_remove_inactive(switch, shell).await?;
+            collect_facts(switch, shell).await?;
+            Ok(summary)
+        }
+        Job::Copy {
+            command, overwrite, ..
+        } => {
+            let result = run_copy(shell, command, *overwrite).await;
+            if let Some(transfer) = switch.transfer.lock().unwrap().as_mut() {
+                transfer.ended = Some(Instant::now());
+            }
+            let summary = result?;
             // The copy just changed how much room is left.
             if let Some(device) = copy_destination_device(command) {
                 switch.facts.lock().unwrap().flash_device = device;
@@ -514,19 +936,17 @@ fn copy_destination_device(command: &str) -> Option<String> {
 /// Read `dir <device>:` and `show version` into the session's facts.
 async fn collect_facts(switch: &Arc<Switch>, shell: &mut Shell) -> Result<()> {
     let device = switch.facts().flash_device;
-    let listing = shell.run_command(&format!("dir {device}"), STEP_TIMEOUT).await?;
+    let listing = shell
+        .run_command(&format!("dir {device}"), STEP_TIMEOUT)
+        .await?;
     let usage = crate::cisco::parse_dir_totals(&listing);
 
     let version_output = shell.run_command("show version", STEP_TIMEOUT).await?;
     let version = crate::cisco::parse_show_version(&version_output);
 
     let mut facts = switch.facts.lock().unwrap();
-    if let Some(usage) = usage {
-        facts.flash = Some(usage);
-    }
-    if version.version.is_some() || !version.members.is_empty() {
-        facts.version = Some(version);
-    }
+    facts.flash = usage;
+    facts.version = Some(version);
     if facts.hostname.is_none() {
         facts.hostname = shell.hostname.clone();
     }
@@ -559,7 +979,10 @@ pub fn fmt_mb(bytes: u64) -> String {
 /// later, how the device is caught the moment it comes back.
 async fn monitor_reachability(switch: Arc<Switch>) {
     loop {
-        if switch.state().is_over() && !matches!(switch.state(), SwitchState::Offline { .. }) {
+        let state = switch.state();
+        if state.is_over()
+            && (!matches!(state, SwitchState::Offline { .. }) || switch.cancel_requested())
+        {
             return;
         }
         let rtt = ping_once(&switch.host).await;
@@ -582,15 +1005,25 @@ async fn monitor_reachability(switch: Arc<Switch>) {
 /// One ICMP echo through the system `ping`, so no raw socket (and no root) is
 /// needed. `None` means no reply.
 async fn ping_once(host: &str) -> Option<Duration> {
-    let output = tokio::process::Command::new("ping")
-        .args(["-n", "-c", "1", "-t", "2", host])
-        .output()
-        .await
-        .ok()?;
+    ping_probe(host).await.ok().flatten()
+}
+
+async fn ping_probe(host: &str) -> Result<Option<Duration>> {
+    let mut command = tokio::process::Command::new("ping");
+    command.kill_on_drop(true).args(["-n", "-c", "1"]);
+    #[cfg(target_os = "macos")]
+    command.args(["-W", "1000"]);
+    #[cfg(not(target_os = "macos"))]
+    command.args(["-W", "1"]);
+    let output =
+        match tokio::time::timeout(Duration::from_secs(2), command.arg(host).output()).await {
+            Ok(output) => output.map_err(|e| anyhow!("cannot run ping: {e}"))?,
+            Err(_) => return Ok(None),
+        };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
-    parse_ping_rtt(&String::from_utf8_lossy(&output.stdout))
+    Ok(parse_ping_rtt(&String::from_utf8_lossy(&output.stdout)))
 }
 
 /// `64 bytes from 10.0.0.1: icmp_seq=0 ttl=254 time=1.234 ms`
@@ -662,11 +1095,13 @@ fn client_config() -> client::Config {
 }
 
 /// Trust on first use: an unknown key is shown to the user and, once accepted,
-/// recorded in transferbuddy's own `known_hosts`. A key that changed is
-/// refused — that is the case a known-hosts file exists for.
+/// recorded in transferbuddy's own `known_hosts`. Single-device adds refuse
+/// changed keys; bulk import and discovery explicitly allow replacements.
 struct ClientHandler {
     switch: Arc<Switch>,
     known_hosts: PathBuf,
+    allow_unknown: bool,
+    auto_trust: bool,
 }
 
 #[async_trait::async_trait]
@@ -678,6 +1113,17 @@ impl client::Handler for ClientHandler {
         server_public_key: &russh_keys::key::PublicKey,
     ) -> Result<bool, Self::Error> {
         let fingerprint = format!("SHA256:{}", server_public_key.fingerprint());
+        if self.auto_trust {
+            store_host_key(
+                &self.switch.host,
+                self.switch.port,
+                server_public_key,
+                &self.known_hosts,
+                true,
+            )?;
+            self.switch.push(LineKind::Info, format!("bulk import: host key {fingerprint} automatically trusted and stored (replacement keys allowed)"));
+            return Ok(true);
+        }
         match russh_keys::check_known_hosts_path(
             &self.switch.host,
             self.switch.port,
@@ -702,10 +1148,14 @@ impl client::Handler for ClientHandler {
             Err(e) => bail!("cannot read {}: {e}", self.known_hosts.display()),
         }
 
+        if !self.allow_unknown {
+            bail!("refresh requires the already trusted device host key");
+        }
         let (tx, rx) = oneshot::channel();
         *self.switch.host_key_reply.lock().unwrap() = Some(tx);
-        self.switch
-            .set_state(SwitchState::HostKey { fingerprint: fingerprint.clone() });
+        self.switch.set_state(SwitchState::HostKey {
+            fingerprint: fingerprint.clone(),
+        });
         let answer = tokio::time::timeout(HOST_KEY_TIMEOUT, rx).await;
         // Take the sender back so a late answer cannot resolve a dead wait.
         self.switch.host_key_reply.lock().unwrap().take();
@@ -720,11 +1170,12 @@ impl client::Handler for ClientHandler {
         // Back to connecting, or the question stays on screen and every
         // further key press reads as another answer to it.
         self.switch.set_state(SwitchState::Connecting);
-        russh_keys::known_hosts::learn_known_hosts_path(
+        store_host_key(
             &self.switch.host,
             self.switch.port,
             server_public_key,
             &self.known_hosts,
+            false,
         )
         .map_err(|e| anyhow!("cannot store the host key: {e}"))?;
         self.switch.push(
@@ -733,6 +1184,63 @@ impl client::Handler for ClientHandler {
         );
         Ok(true)
     }
+}
+
+/// Serialize updates so simultaneous imports cannot overwrite another device's key.
+fn store_host_key(
+    host: &str,
+    port: u16,
+    key: &russh_keys::key::PublicKey,
+    path: &std::path::Path,
+    replace: bool,
+) -> Result<()> {
+    let _guard = KNOWN_HOSTS_WRITE.lock().unwrap();
+    if !replace {
+        russh_keys::known_hosts::learn_known_hosts_path(host, port, key, path)?;
+        return Ok(());
+    }
+    let old = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let matching = russh_keys::known_hosts::known_host_keys_path(host, port, path)?;
+    let name = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    let mut output = String::new();
+    for (i, line) in old.lines().enumerate() {
+        if matching.iter().any(|(number, _)| *number == i + 1) {
+            // Preserve other plain aliases sharing a known_hosts row.
+            if let Some((names, rest)) = line.split_once(' ') {
+                let aliases: Vec<_> = names
+                    .split(',')
+                    .filter(|n| *n != name && !n.starts_with('|'))
+                    .collect();
+                if !aliases.is_empty() {
+                    output.push_str(&format!("{} {rest}\n", aliases.join(",")));
+                }
+            }
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    use russh_keys::PublicKeyBase64;
+    output.push_str(&format!(
+        "{name} {} {}\n",
+        key.name(),
+        key.public_key_base64()
+    ));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("tmp");
+    std::fs::write(&temp, output)?;
+    std::fs::rename(temp, path)?;
+    Ok(())
 }
 
 /// What the device is currently waiting for.
@@ -757,10 +1265,21 @@ fn tail_signal(tail: &str) -> Option<Signal> {
         return None;
     }
     let lower = t.to_ascii_lowercase();
+    // SSH data can split immediately after '?', before the [y/n] suffix.
+    if lower.contains("do you want to remove")
+        && !lower.contains("[y/n]")
+        && !lower.contains("[yes/no]")
+    {
+        return None;
+    }
     if lower.ends_with("password:") || lower.ends_with("passphrase:") {
         return Some(Signal::Password);
     }
-    if t.ends_with('?') || lower.ends_with("[confirm]") {
+    if t.ends_with('?')
+        || lower.ends_with("[confirm]")
+        || lower.ends_with("[y/n]")
+        || lower.ends_with("[yes/no]")
+    {
         return Some(Signal::Question(t.to_string()));
     }
     // A device prompt is a single token ending in # or >, e.g. "cat9k-1#".
@@ -786,6 +1305,7 @@ struct Shell {
     collected: String,
     /// The device's own name, learned from its prompt.
     hostname: Option<String>,
+    record_output: bool,
 }
 
 impl Shell {
@@ -797,9 +1317,12 @@ impl Shell {
             Wire::Answer if text.is_empty() => "<Enter>".to_string(),
             _ => text.to_string(),
         };
-        self.switch.push(LineKind::Sent, shown);
+        if self.record_output {
+            self.switch.push(LineKind::Sent, shown);
+        }
         let line = format!("{text}\r");
         self.channel.data(line.as_bytes()).await?;
+        self.tail.clear();
         Ok(())
     }
 
@@ -811,7 +1334,10 @@ impl Shell {
             match ch {
                 '\n' => {
                     let line = std::mem::take(&mut self.tail);
-                    self.switch.push(LineKind::Output, line.trim_end().to_string());
+                    if self.record_output {
+                        self.switch
+                            .push(LineKind::Output, line.trim_end().to_string());
+                    }
                 }
                 '\r' => {}
                 // Backspace: IOS redraws its line this way.
@@ -821,7 +1347,9 @@ impl Shell {
                 c => self.tail.push(c),
             }
         }
-        *self.switch.live.lock().unwrap() = self.tail.clone();
+        if self.record_output {
+            *self.switch.live.lock().unwrap() = self.tail.clone();
+        }
     }
 
     /// Read until the device asks for something, with a deadline.
@@ -888,30 +1416,36 @@ impl Shell {
 }
 
 /// Connect, authenticate, open a shell and get to a privileged prompt.
-async fn open_shell(switch: &Arc<Switch>, target: &Target) -> Result<Shell> {
+async fn open_shell(switch: &Arc<Switch>, target: &Target, record_output: bool) -> Result<Shell> {
     let handler = ClientHandler {
         switch: switch.clone(),
         known_hosts: target.known_hosts.clone(),
+        allow_unknown: record_output,
+        auto_trust: target.auto_trust,
     };
-    let mut session = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        client::connect(
-            Arc::new(client_config()),
-            (target.host.as_str(), target.port),
-            handler,
-        ),
-    )
-    .await
-    .map_err(|_| {
-        anyhow!(
-            "no answer from {}:{} within {}s",
-            target.host,
-            target.port,
-            CONNECT_TIMEOUT.as_secs()
-        )
-    })??;
+    let connection = client::connect(
+        Arc::new(client_config()),
+        (target.host.as_str(), target.port),
+        handler,
+    );
+    tokio::pin!(connection);
+    let mut elapsed = Duration::ZERO;
+    let mut session = loop {
+        let started = Instant::now();
+        let waiting_for_key = matches!(switch.state(), SwitchState::HostKey { .. });
+        tokio::select! {
+            result = &mut connection => break result?,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if !waiting_for_key && !matches!(switch.state(), SwitchState::HostKey { .. }) { elapsed += started.elapsed(); }
+                if elapsed >= CONNECT_TIMEOUT { bail!("no answer from {}:{} within {}s", target.host, target.port, CONNECT_TIMEOUT.as_secs()); }
+            }
+        }
+    };
 
-    match authenticate(&mut session, target).await {
+    match tokio::time::timeout(STEP_TIMEOUT, authenticate(&mut session, target))
+        .await
+        .map_err(|_| anyhow!("SSH authentication timed out"))?
+    {
         Ok(true) => {}
         Ok(false) => bail!(
             "login failed for user {} — wrong username or password?",
@@ -925,9 +1459,14 @@ async fn open_shell(switch: &Arc<Switch>, target: &Target) -> Result<Shell> {
         ),
     }
 
-    switch.push(LineKind::Info, format!("authenticating as {}", target.username));
+    switch.push(
+        LineKind::Info,
+        format!("authenticating as {}", target.username),
+    );
     let channel = session.channel_open_session().await?;
-    channel.request_pty(true, "vt100", 200, 48, 0, 0, &[]).await?;
+    channel
+        .request_pty(true, "vt100", 200, 48, 0, 0, &[])
+        .await?;
     channel.request_shell(true).await?;
     switch.push(LineKind::Info, "waiting for the device prompt");
 
@@ -938,6 +1477,7 @@ async fn open_shell(switch: &Arc<Switch>, target: &Target) -> Result<Shell> {
         tail: String::new(),
         collected: String::new(),
         hostname: None,
+        record_output,
     };
 
     let mut signal = shell.expect(STEP_TIMEOUT).await?;
@@ -998,6 +1538,174 @@ async fn run_copy(shell: &mut Shell, command: &str, overwrite: bool) -> Result<S
     }
 }
 
+/// Only the deletion section is checked: "File is in use, will not delete"
+/// lines in the preceding inventory must never be mistaken for candidates.
+fn cleanup_candidates(output: &str) -> Vec<String> {
+    let mut deleting = false;
+    let mut files = Vec::new();
+    for line in output.lines().map(str::trim) {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("following files will be deleted") {
+            deleting = true;
+            continue;
+        }
+        if !deleting {
+            continue;
+        }
+        if lower.contains("do you want") {
+            break;
+        }
+        if lower.contains("will not delete") || lower.contains("file is in use") {
+            continue;
+        }
+        for token in line.split_whitespace() {
+            let token = token.trim_matches(['\r', ',']);
+            let is_file = token.contains('/')
+                || token.contains(':')
+                || [".pkg", ".bin", ".conf"]
+                    .iter()
+                    .any(|ext| token.ends_with(ext));
+            if is_file
+                && !token.starts_with('[')
+                && !token.ends_with(':')
+                && !files.iter().any(|f| f == token)
+            {
+                files.push(token.to_string());
+            }
+        }
+    }
+    files
+}
+
+fn release_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+        .flat_map(|token| {
+            let fields: Vec<_> = token.split('.').collect();
+            fields
+                .windows(3)
+                .filter_map(|fields| {
+                    let major: u32 = fields[0].parse().ok()?;
+                    let minor: u32 = fields[1].parse().ok()?;
+                    let digits = fields[2].chars().take_while(char::is_ascii_digit).count();
+                    if digits == 0 {
+                        return None;
+                    }
+                    let patch: u32 = fields[2][..digits].parse().ok()?;
+                    Some(format!(
+                        "{major}.{minor}.{patch}{}",
+                        fields[2][digits..].to_ascii_lowercase()
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn cleanup_warning(files: &[String], version: &VersionInfo) -> Option<String> {
+    let mut running = Vec::new();
+    if let Some(v) = &version.version {
+        running.extend(release_tokens(v));
+    }
+    for member in &version.members {
+        running.extend(release_tokens(&member.version));
+    }
+    if running.is_empty() {
+        return Some("WARNING: running IOS version could not be verified. Review every file before confirming!".into());
+    }
+    if files.is_empty() {
+        return Some("WARNING: the device's deletion list could not be parsed. Review the transcript before confirming!".into());
+    }
+    let active_image = version
+        .image
+        .as_deref()
+        .and_then(|p| p.rsplit(['/', ':']).next());
+    let risky: Vec<_> = files
+        .iter()
+        .filter(|file| {
+            release_tokens(file).iter().any(|v| running.contains(v))
+                || active_image.is_some_and(|image| {
+                    !image.is_empty() && file.rsplit(['/', ':']).next() == Some(image)
+                })
+        })
+        .cloned()
+        .collect();
+    if risky.is_empty() {
+        None
+    } else {
+        Some(format!("DANGER: the switch proposes deleting files for the RUNNING IOS / active image ({}): {}. Confirming may prevent the switch from booting!", version.version.as_deref().unwrap_or("stack versions"), risky.join(", ")))
+    }
+}
+
+async fn run_remove_inactive(switch: &Arc<Switch>, shell: &mut Shell) -> Result<String> {
+    shell.take_output();
+    shell.send("install remove inactive", Wire::Command).await?;
+    let deadline = Instant::now() + Duration::from_secs(30 * 60);
+    let mut declined = false;
+    loop {
+        match shell
+            .expect(deadline.saturating_duration_since(Instant::now()))
+            .await?
+        {
+            Signal::Question(question) => {
+                let lower = question.to_ascii_lowercase();
+                if !(lower.contains("do you want to remove")
+                    && (lower.contains("[y/n]") || lower.contains("[yes/no]")))
+                {
+                    bail!("unexpected cleanup prompt: {question} — cancelled; session closed without answering");
+                }
+                let files = cleanup_candidates(&shell.collected);
+                let version = switch.facts().version.unwrap_or_default();
+                let warning = cleanup_warning(&files, &version);
+                if let Some(warning) = &warning {
+                    switch.push(LineKind::Error, warning.clone());
+                }
+                let (tx, rx) = oneshot::channel();
+                *switch.cleanup_reply.lock().unwrap() = Some(tx);
+                switch.set_state(SwitchState::CleanupConfirm { files, warning });
+                let accepted = tokio::select! {
+                    answer = rx => answer.unwrap_or(false),
+                    _ = cancelled(switch) => false,
+                    _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => false,
+                };
+                switch.cleanup_reply.lock().unwrap().take();
+                switch.set_state(SwitchState::Busy {
+                    what: "install remove inactive".into(),
+                });
+                shell
+                    .send(if accepted { "y" } else { "n" }, Wire::CleanupAnswer)
+                    .await?;
+                // Declining is a normal outcome: drain the remaining output to
+                // the EXEC prompt so this connection can still be reused.
+                declined |= !accepted;
+            }
+            Signal::PromptEnabled(_) => {
+                let output = shell.take_output();
+                if declined {
+                    return Ok("cleanup aborted — no deletion confirmed".into());
+                }
+                if let Some(error) = output.lines().find(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower.contains("failed")
+                        || lower.contains("error:")
+                        || lower.starts_with("% invalid")
+                        || lower.starts_with("%error")
+                }) {
+                    bail!("cleanup failed: {}", error.trim());
+                }
+                if output.contains("Nothing to clean") {
+                    return Ok("nothing to clean — no inactive files found".into());
+                }
+                if output.contains("SUCCESS:") {
+                    return Ok("inactive files removed; flash usage refreshed".into());
+                }
+                bail!("cleanup ended without a SUCCESS result");
+            }
+            Signal::Closed => bail!("the device closed the session during cleanup"),
+            other => bail!("unexpected cleanup state: {other:?} — cancelled; session closed"),
+        }
+    }
+}
+
 /// Password first, keyboard-interactive second — Cisco devices offer one or
 /// the other depending on how the vty lines are configured.
 async fn authenticate(
@@ -1033,8 +1741,14 @@ mod tests {
 
     #[test]
     fn recognises_device_prompts() {
-        assert_eq!(tail_signal("cat9k-1#"), Some(Signal::PromptEnabled("cat9k-1#".into())));
-        assert_eq!(tail_signal("Switch>"), Some(Signal::PromptUser("Switch>".into())));
+        assert_eq!(
+            tail_signal("cat9k-1#"),
+            Some(Signal::PromptEnabled("cat9k-1#".into()))
+        );
+        assert_eq!(
+            tail_signal("Switch>"),
+            Some(Signal::PromptUser("Switch>".into()))
+        );
         assert_eq!(tail_signal("Password: "), Some(Signal::Password));
         assert_eq!(
             tail_signal("Destination filename [img.bin]?"),
@@ -1053,6 +1767,157 @@ mod tests {
         assert_eq!(parse_ping_rtt(output), Some(Duration::from_micros(1234)));
         assert_eq!(parse_ping_rtt("Request timeout for icmp_seq 0\n"), None);
         assert_eq!(parse_ping_rtt(""), None);
+    }
+
+    #[test]
+    fn subnet_ranges_validate_and_exclude_only_real_network_and_broadcast_addresses() {
+        let hosts = subnet_hosts("192.168.10.42/24").unwrap();
+        assert_eq!(hosts.len(), 254);
+        assert_eq!(hosts.first().unwrap(), "192.168.10.1");
+        assert_eq!(hosts.last().unwrap(), "192.168.10.254");
+        assert_eq!(
+            subnet_hosts("192.168.10.0/31").unwrap(),
+            ["192.168.10.0", "192.168.10.1"]
+        );
+        assert_eq!(
+            subnet_hosts("255.255.255.255/32").unwrap(),
+            ["255.255.255.255"]
+        );
+        for invalid in [
+            "192.168.1.0",
+            "bad/24",
+            "192.168.1.0/33",
+            "192.168.1.0/0",
+            "::1/128",
+        ] {
+            assert!(subnet_hosts(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_is_parallel_bounded_and_connects_only_to_replying_hosts() {
+        let scan = Arc::new(SubnetScan {
+            progress: Mutex::new(ScanProgress {
+                total: 64,
+                ..Default::default()
+            }),
+            cancel: AtomicBool::new(false),
+        });
+        let active = Arc::new(AtomicU64::new(0));
+        let peak = Arc::new(AtomicU64::new(0));
+        let replies = Mutex::new(Vec::new());
+        let probe = {
+            let active = active.clone();
+            let peak = peak.clone();
+            move |host: String| {
+                let active = active.clone();
+                let peak = peak.clone();
+                async move {
+                    let concurrent = active.fetch_add(1, Ordering::Relaxed) + 1;
+                    peak.fetch_max(concurrent, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    active.fetch_sub(1, Ordering::Relaxed);
+                    let i: usize = host.parse().unwrap();
+                    if i == 63 {
+                        Err("cannot run ping".into())
+                    } else {
+                        Ok(i.is_multiple_of(2))
+                    }
+                }
+            }
+        };
+        sweep_subnet(
+            (0..64).map(|i| i.to_string()).collect(),
+            scan.clone(),
+            probe,
+            |host| replies.lock().unwrap().push(host),
+        )
+        .await;
+        assert_eq!(peak.load(Ordering::Relaxed), 32);
+        let progress = scan.progress();
+        assert_eq!((progress.checked, progress.reachable), (64, 32));
+        assert!(progress.finished);
+        assert_eq!(progress.error.as_deref(), Some("cannot run ping"));
+        assert!(replies
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|host| host.parse::<usize>().unwrap().is_multiple_of(2)));
+        assert_eq!(replies.lock().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn cleanup_checks_only_candidates_and_all_running_stack_versions() {
+        let output = "cat9k_lite-rpbase.17.12.06.SPA.pkg\nFile is in use, will not delete.\nThe following files will be deleted:\n[switch 1]:\n/flash/cat9k_lite-rpbase.17.12.05.SPA.pkg\n/flash/cat9k_lite_iosxe.17.12.05.SPA.bin\nDo you want to remove the above files? [y/n]";
+        let files = cleanup_candidates(output);
+        assert_eq!(files.len(), 2);
+        let mut version = VersionInfo {
+            version: Some("17.12.06".into()),
+            image: Some("flash:packages.conf".into()),
+            ..Default::default()
+        };
+        assert!(cleanup_warning(&files, &version).is_none());
+        assert!(cleanup_warning(
+            &["/flash/cat9k_lite_iosxe.17.12.6.SPA.bin".into()],
+            &version
+        )
+        .unwrap()
+        .contains("DANGER"));
+        assert!(cleanup_warning(
+            &["/flash/cat9k_lite_iosxe.17.12.060.SPA.bin".into()],
+            &version
+        )
+        .is_none());
+        assert!(cleanup_warning(&["/flash/packages.conf".into()], &version).is_some());
+        version.members.push(crate::cisco::StackMember {
+            number: 2,
+            model: "C9200L".into(),
+            version: "17.12.05".into(),
+            image: "CAT9K_LITE_IOSXE".into(),
+            mode: "INSTALL".into(),
+            active: false,
+        });
+        assert!(cleanup_warning(&files, &version).is_some());
+        assert!(cleanup_warning(&files, &VersionInfo::default())
+            .unwrap()
+            .contains("could not be verified"));
+        assert!(cleanup_warning(&[], &version).is_some());
+        let nothing = "[R0]: /flash/cat9k_lite-rpbase.17.12.06.SPA.pkg File is in use, will not delete.\nSUCCESS: No extra package or provisioning files found on media. Nothing to clean.\nSUCCESS: Files deleted.";
+        assert!(cleanup_candidates(nothing).is_empty());
+        assert_eq!(tail_signal("Do you want to remove the above files?"), None);
+        assert!(matches!(
+            tail_signal("Do you want to remove the above files? [y/n] "),
+            Some(Signal::Question(_))
+        ));
+    }
+
+    #[test]
+    fn bulk_replaces_a_key_without_losing_other_devices_or_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let old = russh_keys::key::KeyPair::generate_ed25519()
+            .clone_public_key()
+            .unwrap();
+        let replacement = russh_keys::key::KeyPair::generate_ed25519()
+            .clone_public_key()
+            .unwrap();
+        store_host_key("10.0.0.1", 22, &old, &path, false).unwrap();
+        store_host_key("10.0.0.2", 22, &old, &path, false).unwrap();
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("10.0.0.1 ", "10.0.0.1,alias ");
+        std::fs::write(&path, text).unwrap();
+        store_host_key("10.0.0.1", 22, &replacement, &path, true).unwrap();
+        store_host_key("10.0.0.1", 22, &replacement, &path, true).unwrap();
+        assert!(russh_keys::check_known_hosts_path("10.0.0.1", 22, &replacement, &path).unwrap());
+        assert!(russh_keys::check_known_hosts_path("10.0.0.2", 22, &old, &path).unwrap());
+        assert!(russh_keys::check_known_hosts_path("alias", 22, &old, &path).unwrap());
+        assert_eq!(
+            russh_keys::known_hosts::known_host_keys_path("10.0.0.1", 22, &path)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1098,11 +1963,17 @@ mod tests {
 
         pub struct Transcript {
             pub received: Vec<String>,
+            pub connections: usize,
+            pub cleanup_output: Option<String>,
         }
 
         impl Transcript {
             pub fn new() -> Arc<Mutex<Self>> {
-                Arc::new(Mutex::new(Self { received: Vec::new() }))
+                Arc::new(Mutex::new(Self {
+                    received: Vec::new(),
+                    connections: 0,
+                    cleanup_output: Some("\r\nThe following files will be deleted:\r\n[switch 1]:\r\n/flash/cat9k_lite-rpbase.17.15.02.SPA.pkg\r\nDo you want to remove the above files? [y/n]".into()),
+                }))
             }
         }
 
@@ -1112,10 +1983,12 @@ mod tests {
             /// Delay before the first prompt, to make the window between
             /// "host key accepted" and "session ready" observable.
             greet_delay: std::time::Duration,
+            copy_delay: std::time::Duration,
             line: String,
             enabled: bool,
             expect_enable_password: bool,
             in_copy: bool,
+            in_cleanup: bool,
             channels: HashMap<ChannelId, Channel<Msg>>,
         }
 
@@ -1125,11 +1998,20 @@ mod tests {
             }
 
             fn prompt(&self) -> &'static str {
-                if self.enabled { "\r\ncat9k-1#" } else { "\r\ncat9k-1>" }
+                if self.enabled {
+                    "\r\ncat9k-1#"
+                } else {
+                    "\r\ncat9k-1>"
+                }
             }
 
             fn on_line(&mut self, session: &mut Session, id: ChannelId, line: &str) {
                 self.log.lock().unwrap().received.push(line.to_string());
+                if self.in_cleanup {
+                    self.in_cleanup = false;
+                    self.say(session, id, "\r\nSUCCESS: install_remove\r\ncat9k-1#");
+                    return;
+                }
 
                 if self.expect_enable_password {
                     self.expect_enable_password = false;
@@ -1154,6 +2036,15 @@ mod tests {
                     return;
                 }
                 match line {
+                    "install remove inactive" => {
+                        let output = self.log.lock().unwrap().cleanup_output.clone();
+                        if let Some(output) = output {
+                            self.in_cleanup = true;
+                            self.say(session, id, &output);
+                        } else {
+                            self.say(session, id, "\r\n[R0]: /flash/cat9k_lite-rpbase.17.15.03.SPA.pkg File is in use, will not delete.\r\nSUCCESS: No extra package or provisioning files found on media. Nothing to clean.\r\nSUCCESS: Files deleted.\r\ncat9k-1#");
+                        }
+                    }
                     "enable" => {
                         self.expect_enable_password = true;
                         self.say(session, id, "\r\nPassword: ");
@@ -1194,11 +2085,18 @@ mod tests {
         impl Handler for Device {
             type Error = russh::Error;
 
-            async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+            async fn auth_password(
+                &mut self,
+                user: &str,
+                password: &str,
+            ) -> Result<Auth, Self::Error> {
                 if user == "netadmin" && password == "letmein" {
+                    self.log.lock().unwrap().connections += 1;
                     Ok(Auth::Accept)
                 } else {
-                    Ok(Auth::Reject { proceed_with_methods: None })
+                    Ok(Auth::Reject {
+                        proceed_with_methods: None,
+                    })
                 }
             }
 
@@ -1249,6 +2147,9 @@ mod tests {
                     match ch {
                         '\r' | '\n' => {
                             let line = std::mem::take(&mut self.line);
+                            if self.in_copy && !self.copy_delay.is_zero() {
+                                tokio::time::sleep(self.copy_delay).await;
+                            }
                             self.on_line(session, id, &line);
                         }
                         c => self.line.push(c),
@@ -1269,6 +2170,15 @@ mod tests {
             enable_password: &str,
             greet_delay: std::time::Duration,
         ) -> u16 {
+            spawn_with_delays(log, enable_password, greet_delay, std::time::Duration::ZERO).await
+        }
+
+        pub async fn spawn_with_delays(
+            log: Arc<Mutex<Transcript>>,
+            enable_password: &str,
+            greet_delay: std::time::Duration,
+            copy_delay: std::time::Duration,
+        ) -> u16 {
             let config = Arc::new(russh::server::Config {
                 methods: MethodSet::PASSWORD,
                 keys: vec![russh_keys::key::KeyPair::generate_ed25519()],
@@ -1283,10 +2193,12 @@ mod tests {
                         log: log.clone(),
                         enable_password: enable_password.clone(),
                         greet_delay,
+                        copy_delay,
                         line: String::new(),
                         enabled: false,
                         expect_enable_password: false,
                         in_copy: false,
+                        in_cleanup: false,
                         channels: HashMap::new(),
                     };
                     let config = config.clone();
@@ -1312,6 +2224,7 @@ mod tests {
             password: "letmein".into(),
             enable_password: "s3cret".into(),
             known_hosts,
+            auto_trust: false,
         }
     }
 
@@ -1381,8 +2294,293 @@ mod tests {
         let received = log.lock().unwrap().received.clone();
         assert_eq!(
             received,
-            vec!["enable", "s3cret", "terminal length 0", "dir flash:", "show version"]
+            vec![
+                "enable",
+                "s3cret",
+                "terminal length 0",
+                "dir flash:",
+                "show version"
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn bulk_connect_trusts_changed_keys_and_reuses_or_replaces_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let log = fake_ios::Transcript::new();
+        let port = fake_ios::spawn(log.clone(), "s3cret").await;
+        let old_key = russh_keys::key::KeyPair::generate_ed25519()
+            .clone_public_key()
+            .unwrap();
+        store_host_key("127.0.0.1", port, &old_key, &path, false).unwrap();
+        let mgr = manager();
+        let mut t = target(port, path.clone());
+        t.auto_trust = true;
+        let sw = mgr.connect(t.clone());
+        let mut other_user = t.clone();
+        other_user.username = "someone else".into();
+        assert!(Arc::ptr_eq(&sw, &mgr.connect(other_user)));
+        wait_for("bulk facts", || {
+            sw.facts().updated.is_some() && sw.state() == SwitchState::Ready
+        })
+        .await;
+        assert!(sw
+            .transcript()
+            .iter()
+            .any(|line| line.text.contains("automatically trusted")));
+        assert_eq!(log.lock().unwrap().connections, 1);
+        let keys = russh_keys::known_hosts::known_host_keys_path("127.0.0.1", port, &path).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_ne!(keys[0].1, old_key);
+        sw.submit(Job::Disconnect);
+        wait_for("closed", || sw.state() == SwitchState::Closed).await;
+        let again = mgr.connect(t);
+        assert_eq!(mgr.list().len(), 1);
+        assert_ne!(again.id, sw.id);
+        wait_for("reconnected", || again.facts().updated.is_some()).await;
+        again.submit(Job::Disconnect);
+    }
+
+    #[tokio::test]
+    async fn host_key_wait_does_not_consume_the_connection_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = fake_ios::spawn(fake_ios::Transcript::new(), "s3cret").await;
+        let mgr = manager();
+        let sw = mgr.connect(target(port, dir.path().join("known_hosts")));
+        wait_for("host key", || {
+            matches!(sw.state(), SwitchState::HostKey { .. })
+        })
+        .await;
+        tokio::time::sleep(CONNECT_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(
+            matches!(sw.state(), SwitchState::HostKey { .. }),
+            "{:?}",
+            sw.state()
+        );
+        sw.answer_host_key(true);
+        wait_for("facts after delayed trust", || sw.facts().updated.is_some()).await;
+        sw.submit(Job::Disconnect);
+    }
+
+    #[tokio::test]
+    async fn cleanup_waits_for_confirmation_and_refreshes_facts_or_reports_nothing_to_clean() {
+        for accept in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = fake_ios::Transcript::new();
+            let port = fake_ios::spawn(log.clone(), "s3cret").await;
+            let mgr = manager();
+            let sw = connected(&mgr, port, dir.path()).await;
+            wait_for("initial facts", || {
+                sw.facts().updated.is_some() && sw.state() == SwitchState::Ready
+            })
+            .await;
+            let before = sw.facts().updated.unwrap();
+            sw.submit(Job::RemoveInactive);
+            wait_for("cleanup confirmation", || {
+                matches!(sw.state(), SwitchState::CleanupConfirm { .. })
+            })
+            .await;
+            assert!(!log
+                .lock()
+                .unwrap()
+                .received
+                .iter()
+                .any(|s| s == "y" || s == "n"));
+            if let SwitchState::CleanupConfirm { files, warning } = sw.state() {
+                assert_eq!(files, ["/flash/cat9k_lite-rpbase.17.15.02.SPA.pkg"]);
+                assert!(warning.is_none());
+            }
+            sw.answer_cleanup(accept);
+            wait_for("cleanup completion", || {
+                sw.jobs_done() == 1 && sw.state() == SwitchState::Ready
+            })
+            .await;
+            assert!(log
+                .lock()
+                .unwrap()
+                .received
+                .iter()
+                .any(|s| s == if accept { "y" } else { "n" }));
+            assert!(sw.facts().updated.unwrap() > before);
+            assert!(sw.last_result().unwrap().unwrap().contains(if accept {
+                "removed"
+            } else {
+                "aborted"
+            }));
+            log.lock().unwrap().cleanup_output = None;
+            sw.submit(Job::RemoveInactive);
+            wait_for("nothing to clean", || sw.jobs_done() == 2).await;
+            assert!(sw
+                .last_result()
+                .unwrap()
+                .unwrap()
+                .contains("nothing to clean"));
+            sw.submit(Job::Disconnect);
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_warns_about_running_release_before_any_yes_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = fake_ios::Transcript::new();
+        log.lock().unwrap().cleanup_output = Some("\r\nThe following files will be deleted:\r\n/flash/cat9k_lite_iosxe.17.15.03.SPA.bin\r\nDo you want to remove the above files? [y/n]".into());
+        let port = fake_ios::spawn(log.clone(), "s3cret").await;
+        let mgr = manager();
+        let sw = connected(&mgr, port, dir.path()).await;
+        wait_for("ready", || {
+            sw.facts().updated.is_some() && sw.state() == SwitchState::Ready
+        })
+        .await;
+        sw.submit(Job::RemoveInactive);
+        wait_for("danger warning", || {
+            matches!(
+                sw.state(),
+                SwitchState::CleanupConfirm {
+                    warning: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(sw
+            .transcript()
+            .iter()
+            .any(|line| line.text.contains("DANGER")));
+        assert!(!log.lock().unwrap().received.iter().any(|line| line == "y"));
+        sw.answer_cleanup(false);
+        wait_for("abort", || sw.jobs_done() == 1).await;
+        sw.submit(Job::Disconnect);
+    }
+
+    #[tokio::test]
+    async fn subnet_scan_connects_to_a_pingable_host_and_is_cancellable() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = fake_ios::spawn(fake_ios::Transcript::new(), "s3cret").await;
+        let mgr = manager();
+        mgr.start_scan_with_probe(
+            target(port, dir.path().join("known_hosts")),
+            "127.0.0.1/32",
+            Protocol::Sftp,
+            |_| async { Ok(true) },
+        )
+        .unwrap();
+        wait_for("scan", || mgr.scan().unwrap().progress().finished).await;
+        let progress = mgr.scan().unwrap().progress();
+        assert_eq!(
+            (progress.checked, progress.total, progress.reachable),
+            (1, 1, 1)
+        );
+        let sw = mgr.list().pop().unwrap();
+        assert_eq!(sw.protocol(), Protocol::Sftp);
+        wait_for("auto trusted SSH", || sw.facts().updated.is_some()).await;
+        sw.submit(Job::Disconnect);
+        mgr.start_scan(
+            target(port, dir.path().join("known_hosts")),
+            "127.0.0.0/16",
+            Protocol::Http,
+        )
+        .unwrap();
+        assert!(mgr
+            .start_scan(
+                target(port, dir.path().join("known_hosts")),
+                "127.0.0.1/32",
+                Protocol::Http
+            )
+            .is_err());
+        mgr.scan().unwrap().cancel();
+        wait_for("cancelled scan", || mgr.scan().unwrap().progress().finished).await;
+        assert!(mgr.scan().unwrap().progress().cancelled);
+        assert_eq!(mgr.scan().unwrap().progress().checked, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_during_copy_uses_a_second_ssh_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = fake_ios::Transcript::new();
+        let port = fake_ios::spawn_with_delays(
+            log.clone(),
+            "s3cret",
+            Duration::ZERO,
+            Duration::from_secs(2),
+        )
+        .await;
+        let mgr = manager();
+        let sw = connected(&mgr, port, dir.path()).await;
+        wait_for("initial facts and ready state", || {
+            sw.facts().version.is_some() && sw.state() == SwitchState::Ready
+        })
+        .await;
+        let before = sw.facts().updated.unwrap();
+        sw.submit(Job::Copy {
+            rel_path: "image.bin".into(),
+            command: "copy http://10.0.0.1/image.bin flash:".into(),
+            overwrite: false,
+        });
+        wait_for("copy prompt", || {
+            sw.transcript().iter().any(|l| l.text == "<Enter>")
+        })
+        .await;
+        assert!(mgr.refresh_facts(sw.clone()));
+        wait_for("facts refreshed while copying", || {
+            sw.facts().updated.is_some_and(|t| t > before)
+        })
+        .await;
+        assert_eq!(
+            sw.jobs_done(),
+            0,
+            "refresh waited for the primary console's copy to finish"
+        );
+        assert!(matches!(sw.state(), SwitchState::Busy { .. }));
+        assert_eq!(log.lock().unwrap().connections, 2);
+        wait_for("copy completion", || sw.jobs_done() == 1).await;
+        assert!(sw.last_result().unwrap().is_ok());
+        sw.cancel();
+        sw.submit(Job::Disconnect);
+    }
+
+    #[test]
+    fn deploy_metrics_use_matching_server_bytes_and_current_speed() {
+        let sessions = SessionManager::new(600);
+        let sw = Switch::for_test(
+            "192.0.2.1",
+            SwitchState::Ready,
+            Facts::default(),
+            Vec::new(),
+        );
+        sw.begin_transfer("image.bin".into(), 10_000_000, Protocol::Http);
+        let h = sessions.open(Protocol::Http, "192.0.2.1:50000".parse().unwrap(), 8080);
+        sessions.update(h.id, |s| {
+            s.file = Some("image.bin".into());
+            s.total = Some(10_000_000);
+            s.direction = Some(crate::session::Direction::Download);
+            s.state = crate::session::SessionState::Transferring;
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        h.add_bytes(5_000_000);
+        sessions.sample();
+        let other = sessions.open(Protocol::Http, "192.0.2.2:50000".parse().unwrap(), 8080);
+        sessions.update(other.id, |s| {
+            s.file = Some("image.bin".into());
+            s.total = Some(10_000_000);
+            s.direction = Some(crate::session::Direction::Download);
+            s.state = crate::session::SessionState::Transferring;
+        });
+        let transfer = sw.transfer(&sessions).unwrap();
+        assert_eq!(transfer.size, 10_000_000);
+        let stats = transfer.session.unwrap();
+        assert_eq!(stats.id, h.id);
+        assert_eq!(stats.bytes, 5_000_000);
+        assert_eq!(stats.progress(), Some(0.5));
+        assert!(stats.current_speed > 0.0);
+        assert!(stats.eta().is_some());
+        h.add_bytes(5_000_000);
+        sessions.finish(h.id, crate::session::SessionState::Completed);
+        sw.transfer.lock().unwrap().as_mut().unwrap().ended = Some(Instant::now());
+        let stats = sw.transfer(&sessions).unwrap().session.unwrap();
+        assert_eq!(stats.bytes, 10_000_000);
+        assert_eq!(stats.current_speed, 0.0);
+        assert!(stats.eta().is_none());
     }
 
     #[tokio::test]
@@ -1403,7 +2601,10 @@ mod tests {
         wait_for("the copy to finish", || sw.last_result().is_some()).await;
 
         let summary = sw.last_result().unwrap().expect("copy should succeed");
-        assert!(summary.contains("504057659 bytes copied in"), "summary: {summary}");
+        assert!(
+            summary.contains("504057659 bytes copied in"),
+            "summary: {summary}"
+        );
         // The session is still open and usable afterwards.
         wait_for("the session to settle", || sw.state() == SwitchState::Ready).await;
 
@@ -1417,8 +2618,8 @@ mod tests {
                 "dir flash:",
                 "show version",
                 command,
-                "",              // Enter on "Destination filename [...]?"
-                "dir flash:",    // free space re-read after the copy
+                "",           // Enter on "Destination filename [...]?"
+                "dir flash:", // free space re-read after the copy
                 "show version",
             ]
         );
@@ -1481,8 +2682,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = fake_ios::Transcript::new();
         // Slow to greet, so the window between "accepted" and "ready" is real.
-        let port =
-            fake_ios::spawn_with_delay(log, "s3cret", Duration::from_millis(1500)).await;
+        let port = fake_ios::spawn_with_delay(log, "s3cret", Duration::from_millis(1500)).await;
         let mgr = manager();
         let sw = mgr.connect(target(port, dir.path().join("known_hosts")));
         wait_for("the host key question", || {
@@ -1499,7 +2699,10 @@ mod tests {
         .await;
         // The device has not greeted yet, so the session cannot be ready —
         // but the question must already be gone.
-        assert!(!sw.state().is_live(), "the device greeted too early for this test");
+        assert!(
+            !sw.state().is_live(),
+            "the device greeted too early for this test"
+        );
         assert!(
             !matches!(sw.state(), SwitchState::HostKey { .. }),
             "the host key question outlived the answer: {:?}",

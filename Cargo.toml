@@ -1,6 +1,6 @@
 [package]
 name = "transferbuddy"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 description = "Multi-protocol file transfer server for provisioning Cisco network devices (FTP/HTTP/HTTPS/SCP/SFTP/TFTP) with a keyboard-driven TUI"
 license = "MIT"

@@ -2,9 +2,10 @@
 //!
 //! This module is pure policy — no sockets, no state. It is the one place
 //! that decides what may be sent, and [`crate::switch`] runs nothing past it.
-//! transferbuddy types six kinds of line on a device: `terminal length 0`,
+//! transferbuddy types seven kinds of line on a device: `terminal length 0`,
 //! `enable`, `show version`, `dir <device>:`, one `copy <url> <device>:` and
-//! `exit` — plus the answers `<Enter>` and `n` to the prompts `copy` asks.
+//! `exit`, and an explicitly confirmed `install remove inactive` — plus the
+//! answers `<Enter>` and `n` for copy, and `y`/`n` for cleanup.
 //! A configuration command, a `reload`, a `write`, a `delete` or a copy into
 //! `running-config` cannot pass [`vet`]. See [`check_command`] and
 //! [`check_destination`].
@@ -13,11 +14,19 @@ use anyhow::{bail, Result};
 
 /// Exact commands that need no arguments. `copy` and `dir` take one and are
 /// checked separately.
-const ALLOWED_COMMANDS: &[&str] = &["terminal length 0", "enable", "exit", "show version", "dir"];
+const ALLOWED_COMMANDS: &[&str] = &[
+    "terminal length 0",
+    "enable",
+    "exit",
+    "show version",
+    "dir",
+    "install remove inactive",
+];
 
 /// URL schemes a `copy` source may use — all of them served by transferbuddy.
-const ALLOWED_SCHEMES: &[&str] =
-    &["ftp://", "http://", "https://", "scp://", "sftp://", "tftp://"];
+const ALLOWED_SCHEMES: &[&str] = &[
+    "ftp://", "http://", "https://", "scp://", "sftp://", "tftp://",
+];
 
 /// Destinations that would change the device's configuration or state rather
 /// than write a file. Matched anywhere in the destination.
@@ -62,6 +71,8 @@ pub enum Wire {
     Command,
     /// An answer to a prompt: Enter (accept the default) or `n` (decline).
     Answer,
+    /// Only the explicitly confirmed `install remove inactive` workflow.
+    CleanupAnswer,
     /// A password. Never echoed into the transcript or the log.
     Secret,
 }
@@ -80,6 +91,8 @@ pub fn vet(text: &str, wire: Wire) -> Result<(), String> {
                 Err(format!("refused: {text:?} is not an allowed prompt answer"))
             }
         }
+        Wire::CleanupAnswer if text == "y" || text == "n" => Ok(()),
+        Wire::CleanupAnswer => Err("refused: cleanup accepts only y or n".into()),
         // Only ever sent in reply to a `Password:` prompt, where IOS reads a
         // secret and not a command. The line-break check above still applies.
         Wire::Secret => Ok(()),
@@ -200,7 +213,11 @@ pub fn classify_prompt(prompt: &str, overwrite: bool) -> PromptAction {
         return PromptAction::Decline;
     }
     if lower.contains("over write") || lower.contains("overwrite") {
-        return if overwrite { PromptAction::Accept } else { PromptAction::Decline };
+        return if overwrite {
+            PromptAction::Accept
+        } else {
+            PromptAction::Decline
+        };
     }
     for known in [
         "destination filename",
@@ -296,7 +313,14 @@ mod tests {
 
     #[test]
     fn copy_destination_must_be_a_storage_device() {
-        for dst in ["flash:", "flash:img.bin", "bootflash:", "flash-1:", "usbflash0:", "disk0:img.bin"] {
+        for dst in [
+            "flash:",
+            "flash:img.bin",
+            "bootflash:",
+            "flash-1:",
+            "usbflash0:",
+            "disk0:img.bin",
+        ] {
             assert!(
                 check_command(&format!("copy tftp://10.0.0.1/img.bin {dst}")).is_ok(),
                 "must be allowed: {dst}"
