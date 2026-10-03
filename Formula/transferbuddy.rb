@@ -25,8 +25,9 @@ class Transferbuddy < Formula
   end
 
   test do
-    # Version banner works.
-    assert_match version.to_s, shell_output("#{bin}/transferbuddy --version")
+    # HEAD has no fixed formula version; the binary still reports full semver.
+    assert_match(/\Atransferbuddy \d+\.\d+\.\d+\s*\z/,
+                 shell_output("#{bin}/transferbuddy --version"))
 
     # Serve a file over HTTP and fetch it back.
     (testpath/"share/hello.txt").write "hello from transferbuddy"
