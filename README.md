@@ -144,6 +144,10 @@ Notes:
 
 Requires a Rust toolchain (`rustup`, stable):
 
+Release builds and CI use **Rust 1.94.0** so formatting, lint checks and binaries
+use the same compiler. If building with another installed toolchain, use
+`cargo +1.94.0` to reproduce that environment.
+
 ```bash
 cargo install --path .
 # or:

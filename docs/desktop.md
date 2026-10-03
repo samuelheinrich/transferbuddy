@@ -7,7 +7,8 @@ See the [installation guide](../README.md#installation) and
 
 The workspace version in the root `Cargo.toml` is the source for every binary,
 crate, title, `--version` output and installer. The desktop uses egui/eframe
-0.35, compatible with the repository's Rust 1.94 toolchain. Core has no UI
+0.35. Release binaries and CI use Rust 1.94.0; the workflows pin it explicitly
+so future stable releases do not change the release's lint checks. Core has no UI
 framework dependency. `cargo build` and `cargo test` default to the existing
 terminal package; use `--workspace` to include desktop and port-helper.
 
