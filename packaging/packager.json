@@ -24,6 +24,14 @@
   },
   "resources": [
     {
+      "src": "LICENSE",
+      "target": "LICENSE.txt"
+    },
+    {
+      "src": "crates/desktop/assets/fonts/OFL.txt",
+      "target": "licenses/JetBrainsMono-OFL.txt"
+    },
+    {
       "src": "packaging/macos/com.transferbuddy.port-helper.plist",
       "target": "../Library/LaunchDaemons/com.transferbuddy.port-helper.plist"
     }
