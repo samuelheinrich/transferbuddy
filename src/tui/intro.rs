@@ -49,10 +49,7 @@ const SUBTITLE: &str = "MULTI PROTOCOL FILE TRANSFER FOR CISCO GEAR";
 /// Play the intro, then hold the finished screen until the user starts the
 /// TUI with Enter, Space or Esc. A key during the animation only fast-forwards
 /// to the end — nobody falls into the TUI by accident.
-pub fn play(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    sound: bool,
-) -> Result<()> {
+pub fn play(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, sound: bool) -> Result<()> {
     crate::sound::play(sound, crate::sound::Tone::Boot);
     for frame in 0..FRAMES {
         terminal.draw(|f| draw(f, frame, false))?;
@@ -70,10 +67,7 @@ pub fn play(
         if event::poll(Duration::from_millis(120))? {
             if let CEvent::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press
-                    && matches!(
-                        k.code,
-                        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Esc
-                    )
+                    && matches!(k.code, KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Esc)
                 {
                     return Ok(());
                 }
@@ -143,7 +137,11 @@ fn draw(f: &mut Frame, frame: usize, waiting: bool) {
 
     // Phase 4: READY prompt with a blinking cursor.
     if frame > 42 {
-        let cursor = if (frame / 4).is_multiple_of(2) { "█" } else { " " };
+        let cursor = if (frame / 4).is_multiple_of(2) {
+            "█"
+        } else {
+            " "
+        };
         lines.push(Line::from(vec![
             Span::styled("READY", Style::default().fg(theme::HILITE).bold()),
             Span::styled(format!(" {cursor}"), Style::default().fg(theme::HILITE)),
@@ -194,6 +192,21 @@ fn draw(f: &mut Frame, frame: usize, waiting: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "Generate documentation screenshots from the real intro renderer"]
+    fn intro_documentation_screenshots() {
+        let output =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/screenshots/tui");
+        for (name, frame, waiting) in [("intro-anim", 28, false), ("intro-ready", 56, true)] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| draw(f, frame, waiting)).unwrap();
+            super::super::screenshots::save(
+                terminal.backend().buffer(),
+                &output.join(format!("{name}.svg")),
+            );
+        }
+    }
 
     #[test]
     fn banner_rows_are_rectangular() {

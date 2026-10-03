@@ -1,43 +1,23 @@
 [package]
 name = "transferbuddy"
-version = "0.2.2"
+version.workspace = true
 edition = "2021"
 description = "Multi-protocol file transfer server for provisioning Cisco network devices (FTP/HTTP/HTTPS/SCP/SFTP/TFTP) with a keyboard-driven TUI"
 license = "MIT"
 
 [dependencies]
-# CLI
+transferbuddy-core = { path = "crates/core" }
 clap = { version = "4", features = ["derive"] }
-# Async runtime
 tokio = { version = "1", features = ["full"] }
-# TUI
 ratatui = "0.29"
 crossterm = "0.28"
-# TLS / certificates
-tokio-rustls = "0.26"
-rustls = "0.23"
-rustls-pemfile = "2"
-rcgen = "0.13"
-# SSH (SFTP + SCP)
-russh = "0.46"
-russh-keys = "0.46"
-russh-sftp = "2"
-# Config
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-# Utilities
-dirs = "5"
-if-addrs = "0.13"
-chrono = { version = "0.4", features = ["serde"] }
-rand = "0.8"
-sha2 = "0.10"
-md-5 = "0.10"
 anyhow = "1"
-async-trait = "0.1"
 libc = "0.2"
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+transferbuddy-core = { path = "crates/core", features = ["test-support"] }
 
 [profile.release]
 lto = true
@@ -46,3 +26,11 @@ opt-level = 3
 
 [dev-dependencies.libc]
 version = "0.2"
+
+[workspace]
+members = ["crates/core", "crates/desktop", "crates/port-helper"]
+default-members = ["."]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.14"

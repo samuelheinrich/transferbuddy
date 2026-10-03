@@ -86,5 +86,8 @@ pub fn selected() -> Style {
 
 /// Strongly selected row (inside modals, where only one thing is in focus).
 pub fn selected_strong() -> Style {
-    Style::default().bg(ACCENT).fg(Color::Rgb(0x0b, 0x0f, 0x1a)).bold()
+    Style::default()
+        .bg(ACCENT)
+        .fg(Color::Rgb(0x0b, 0x0f, 0x1a))
+        .bold()
 }

@@ -1,8 +1,6 @@
 use chrono::{DateTime, Local};
 use ratatui::prelude::*;
-use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 
 use crate::logging::LogLevel;
 use crate::services::{ServiceId, ServiceStatus};
@@ -12,6 +10,7 @@ use crate::switch::{LineKind, SwitchState};
 use super::{theme, DeployField, EditField, Modal, Tab, Ui};
 
 pub fn draw(f: &mut Frame, ui: &mut Ui) {
+    ui.upgrade_buttons.clear();
     // Paint the retro background first; every panel keeps it.
     f.render_widget(Block::default().style(theme::screen()), f.area());
 
@@ -25,9 +24,8 @@ pub fn draw(f: &mut Frame, ui: &mut Ui) {
     draw_tabs(f, ui, chunks[0]);
     match ui.tab {
         Tab::Dashboard => draw_dashboard(f, ui, chunks[1]),
-        Tab::Services => draw_services(f, ui, chunks[1]),
+        Tab::Connect => draw_connections(f, ui, chunks[1]),
         Tab::Files => draw_files(f, ui, chunks[1]),
-        Tab::Sessions => draw_sessions(f, ui, chunks[1]),
         Tab::Logs => draw_logs(f, ui, chunks[1]),
         Tab::Upgrade => draw_switches(f, ui, chunks[1]),
     }
@@ -78,54 +76,49 @@ fn draw_tabs(f: &mut Frame, ui: &Ui, area: Rect) {
 fn footer_keys(tab: Tab) -> Vec<(&'static str, &'static str)> {
     match tab {
         Tab::Dashboard => vec![
-            ("q", "quit"),
-            ("h", "help"),
-            ("m", "sound"),
-            ("i", "address"),
-            ("←/→", "view"),
-        ],
-        Tab::Services => vec![
+            ("Tab", "services/transfers"),
             ("Enter", "edit"),
-            ("Space", "on/off"),
+            ("Space", "enable"),
             ("s", "start/stop"),
-            ("r", "restart"),
             ("S", "all"),
-            ("X", "stop all"),
-            ("p", "port"),
-            ("b", "bind"),
-            ("n", "user"),
-            ("w", "pass"),
-            ("u", "uploads"),
-            ("d", "dir"),
-            ("L", "logs"),
+            ("1–5", "view"),
+        ],
+        Tab::Connect => vec![
+            ("a", "add"),
+            ("b", "bulk/subnet"),
+            ("Enter", "console"),
+            ("c", "CLI"),
+            ("r", "refresh/reconnect"),
+            ("x", "disconnect"),
+            ("1–5", "view"),
         ],
         Tab::Files => vec![
-            ("Enter", "open"),
-            ("Bksp", "up"),
-            ("d", "deploy"),
-            ("H", "hashes"),
-            ("s", "sort"),
-            ("/", "filter"),
+            ("Tab", "pane"),
+            ("Enter", "open/copy"),
+            ("Del/D", "delete remote"),
+            ("Bksp/Home", "up/root"),
+            ("t", "transfer"),
+            ("p", "protocol"),
             ("R", "refresh"),
-            ("y", "copy"),
+            ("H", "hash"),
+            ("1–5", "view"),
         ],
-        Tab::Sessions => vec![("↑↓", "select"), ("B", "bit/byte"), ("←/→", "view")],
         Tab::Upgrade => vec![
-            ("Tab", "menu/devices"),
-            ("a/b", "add/import"),
-            ("f", "file"),
-            ("d", "deploy"),
-            ("Enter", "select"),
-            ("r", "refresh"),
-            ("x", "disconnect"),
-            ("X", "clear closed"),
+            ("Tab", "files/jobs"),
+            ("p", "protocol"),
+            ("a/A", "assign one/all"),
+            ("d/V", "deploy/verify"),
+            ("u/Y", "install/YOLO"),
+            ("i", "cleanup"),
+            ("1–5", "view"),
         ],
         Tab::Logs => vec![
             ("↑↓", "scroll"),
             ("G", "follow"),
             ("/", "filter"),
             ("L", "level"),
-            ("P", "proto"),
+            ("P", "protocol"),
+            ("1–5", "view"),
         ],
     }
 }
@@ -141,6 +134,8 @@ fn draw_footer(f: &mut Frame, ui: &Ui, area: Rect) {
     } else {
         spans.push(Span::raw(" "));
     }
+    spans.push(theme::key("W"));
+    spans.push(Span::styled(" workflow  ", Style::default().fg(theme::DIM)));
     for (key, desc) in footer_keys(ui.tab) {
         spans.push(theme::key(key));
         spans.push(Span::styled(
@@ -172,332 +167,240 @@ fn level_color(level: LogLevel) -> Color {
     }
 }
 
-fn draw_dashboard(f: &mut Frame, ui: &Ui, area: Rect) {
-    // The log pane gets its own full-width block at the bottom and all the
-    // space the other panes do not need.
+fn draw_dashboard(f: &mut Frame, ui: &mut Ui, area: Rect) {
+    let service_height = area.height.saturating_sub(11).clamp(9, 19);
     let chunks = Layout::vertical([
-        Constraint::Length(7),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Min(5),
+        Constraint::Length(5),
+        Constraint::Length(service_height),
+        Constraint::Min(6),
     ])
     .split(area);
-
     let cfg = ui.app.config.read().unwrap();
-    let (completed, bytes) = ui.app.sessions.totals();
-    let active = ui.app.sessions.active_count();
-    let (advertised, advertised_source) = super::advertised_now(&cfg);
-    let advertised = advertised
-        .map(|i| i.to_string())
-        .unwrap_or_else(|| "-".into());
-    let summary = vec![
+    let (address, source) = super::advertised_now(&cfg);
+    let lines = vec![
         Line::from(vec![
-            theme::label("root:              "),
+            theme::label("Root: "),
             theme::value(cfg.root.display().to_string()),
         ]),
         Line::from(vec![
-            theme::label("address in URLs:   "),
-            Span::styled(advertised, Style::default().fg(theme::HILITE).bold()),
-            theme::label(format!("  ({advertised_source}, ")),
-            theme::key("i"),
-            theme::label(" changes it)   privileged: "),
-            theme::value(if ui.app.privileged {
-                "yes (sudo)"
-            } else {
-                "no"
-            }),
-        ]),
-        Line::from(vec![
-            theme::label("credentials:       "),
-            Span::styled(
-                format!("{} / {}", cfg.auth.username, cfg.auth.password),
-                Style::default().fg(theme::ACCENT),
-            ),
-        ]),
-        Line::from(vec![
-            theme::label("sessions:          "),
-            theme::value(format!("{active} active")),
-            theme::label("   transfers: "),
+            theme::label("address in URLs: "),
             theme::value(format!(
-                "{completed} completed, {} served",
-                fmt_bytes(bytes)
+                "{} ({source})",
+                address.map(|ip| ip.to_string()).unwrap_or_default()
             )),
+            theme::label(" | i changes address"),
         ]),
-        Line::from(vec![
-            theme::label("log file:          "),
-            theme::value(
-                ui.app
-                    .logger
-                    .file_path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(disabled)".into()),
-            ),
-        ]),
+        Line::from(theme::label(format!(
+            "1–5 tabs | Tab: services / transfers | {} active file sessions | logs: 5",
+            ui.app.sessions.active_count()
+        ))),
     ];
     f.render_widget(
-        Paragraph::new(summary).block(theme::panel_double(&format!(
+        Paragraph::new(lines).block(theme::panel_double(&format!(
             " TRANSFERBUDDY v{} ",
             crate::VERSION
         ))),
         chunks[0],
     );
-
-    let rows: Vec<Row> = ServiceId::ALL
-        .iter()
-        .map(|id| {
-            let sc = cfg.service(*id);
-            let status = ui.app.services.status(*id);
-            let uptime = ui
-                .app
-                .services
-                .uptime(*id)
-                .map(fmt_duration)
-                .unwrap_or_else(|| "-".into());
-            let sessions = match id {
-                ServiceId::Ssh => {
-                    ui.app
-                        .sessions
-                        .active_count_for(crate::session::Protocol::Sftp)
-                        + ui.app
-                            .sessions
-                            .active_count_for(crate::session::Protocol::Scp)
-                }
-                ServiceId::Http => ui
-                    .app
-                    .sessions
-                    .active_count_for(crate::session::Protocol::Http),
-                ServiceId::Https => ui
-                    .app
-                    .sessions
-                    .active_count_for(crate::session::Protocol::Https),
-                ServiceId::Ftp => ui
-                    .app
-                    .sessions
-                    .active_count_for(crate::session::Protocol::Ftp),
-                ServiceId::Tftp => ui
-                    .app
-                    .sessions
-                    .active_count_for(crate::session::Protocol::Tftp),
-            };
-            let crypto = if id.encrypted() {
-                Span::styled("encrypted", Style::default().fg(theme::OK))
-            } else {
-                Span::styled("CLEARTEXT", Style::default().fg(theme::WARN).bold())
-            };
-            let err = match &status {
-                ServiceStatus::Failed(e) => e.clone(),
-                _ => String::new(),
-            };
-            Row::new(vec![
-                Cell::from(Span::styled(
-                    id.display_name(),
-                    Style::default().fg(theme::CYAN).bold(),
-                )),
-                Cell::from(Span::styled(
-                    status.label().to_string(),
-                    status_style(&status),
-                )),
-                Cell::from(if sc.enabled {
-                    Span::styled("on", Style::default().fg(theme::OK))
-                } else {
-                    Span::styled("off", Style::default().fg(theme::DIM))
-                }),
-                Cell::from(sc.port.to_string()),
-                Cell::from(sc.bind.clone()),
-                Cell::from(sessions.to_string()),
-                Cell::from(uptime),
-                Cell::from(crypto),
-                Cell::from(Span::styled(err, Style::default().fg(theme::ERR))),
-            ])
-        })
-        .collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(4),
-            Constraint::Length(6),
-            Constraint::Length(16),
-            Constraint::Length(5),
-            Constraint::Length(9),
-            Constraint::Length(10),
-            Constraint::Min(10),
-        ],
-    )
-    .style(Style::default().fg(theme::TEXT))
-    .header(
-        Row::new(vec![
-            "service", "status", "on", "port", "bind", "sess", "uptime", "crypto", "error",
-        ])
-        .style(theme::header()),
-    )
-    .block(theme::panel(" SERVICES (2) "));
-    f.render_widget(table, chunks[1]);
-
-    // Quick views: files, sessions, interfaces.
-    let cols = Layout::horizontal([
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-    ])
-    .split(chunks[2]);
-
-    let (n_files, n_dirs, total, recent) = scan_root(&cfg.root);
-    let mut file_lines = vec![
-        Line::from(vec![
-            theme::label("items: "),
-            theme::value(format!("{n_files} files, {n_dirs} dirs")),
-        ]),
-        Line::from(vec![
-            theme::label("size:  "),
-            theme::value(fmt_bytes(total)),
-        ]),
-    ];
-    if !recent.is_empty() {
-        file_lines.push(Line::from(theme::label("recent:")));
-        for name in &recent {
-            file_lines.push(Line::from(Span::styled(
-                format!("  {name}"),
-                Style::default().fg(theme::CYAN),
-            )));
-        }
-    }
-    f.render_widget(
-        Paragraph::new(file_lines).block(theme::panel(" FILES (3) ")),
-        cols[0],
-    );
-
-    let snap = ui.app.sessions.snapshot();
-    let mut sess_lines = vec![
-        Line::from(vec![
-            theme::label("now:   "),
-            theme::value(format!("{active} active")),
-        ]),
-        Line::from(vec![
-            theme::label("total: "),
-            theme::value(format!("{completed} done, {}", fmt_bytes(bytes))),
-        ]),
-    ];
-    if snap.is_empty() {
-        sess_lines.push(Line::from(theme::label("  no sessions yet")));
-    } else {
-        for s in snap.iter().rev().take(4) {
-            let color = if s.state.is_active() {
-                theme::HILITE
-            } else {
-                theme::DIM
-            };
-            sess_lines.push(Line::from(Span::styled(
-                format!(
-                    "  {} {} {}",
-                    s.protocol.label(),
-                    s.state.label(),
-                    s.file.clone().unwrap_or_default()
-                ),
-                Style::default().fg(color),
-            )));
-        }
-    }
-    f.render_widget(
-        Paragraph::new(sess_lines).block(theme::panel(" SESSIONS (4) ")),
-        cols[1],
-    );
-
-    let (in_use, pinned) = {
-        let cfg = ui.app.config.read().unwrap();
-        (super::advertised_now(&cfg).0, cfg.advertise.is_some())
-    };
-    let mut if_lines = Vec::new();
-    for ifa in crate::netif::interfaces().into_iter().take(6) {
-        let active = Some(ifa.ip) == in_use;
-        if_lines.push(Line::from(vec![
-            Span::styled(
-                if active { "→ " } else { "  " },
-                Style::default().fg(theme::HILITE).bold(),
-            ),
-            Span::styled(
-                format!("{:<7} {}", ifa.name, ifa.ip),
-                if active {
-                    Style::default().fg(theme::HILITE).bold()
-                } else {
-                    Style::default().fg(theme::TEXT)
-                },
-            ),
-            theme::label(format!("  {}", ifa.kind.label())),
-        ]));
-    }
-    if_lines.push(Line::from(vec![
-        Span::raw("  "),
-        theme::key("i"),
-        theme::label(if pinned {
-            " pinned — cycle"
-        } else {
-            " pin an interface"
-        }),
-    ]));
-    f.render_widget(
-        Paragraph::new(if_lines).block(theme::panel(" INTERFACES ")),
-        cols[2],
-    );
-
-    // Logs — full width, own block, everything that is left over.
-    let log_height = chunks[3].height.saturating_sub(2) as usize;
-    let entries = ui.app.logger.entries();
-    let log_lines: Vec<Line> = entries
-        .iter()
-        .rev()
-        .take(log_height.max(1))
-        .rev()
-        .map(|e| {
-            Line::from(Span::styled(
-                e.render_line(),
-                Style::default().fg(level_color(e.level)),
-            ))
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(if log_lines.is_empty() {
-            vec![Line::from(theme::label("  no log entries"))]
-        } else {
-            log_lines
-        })
-        .block(theme::panel(" LOGS (5) ")),
-        chunks[3],
-    );
+    drop(cfg);
+    draw_services(f, ui, chunks[1]);
+    draw_sessions(f, ui, chunks[2]);
 }
 
-/// Lightweight top-level scan of the shared root for the dashboard summary.
-fn scan_root(root: &std::path::Path) -> (usize, usize, u64, Vec<String>) {
-    let mut files = 0usize;
-    let mut dirs = 0usize;
-    let mut total = 0u64;
-    let mut recent: Vec<(std::time::SystemTime, String)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(root) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
-            }
-            let Ok(meta) = e.metadata() else { continue };
-            if meta.is_dir() {
-                dirs += 1;
+pub fn reboot_color(progress: &crate::upgrade::Progress) -> Color {
+    match progress {
+        crate::upgrade::Progress::Rebooting { since, .. } if since.elapsed().as_secs() >= 600 => {
+            theme::ERR
+        }
+        crate::upgrade::Progress::Rebooting { since, .. } if since.elapsed().as_secs() >= 300 => {
+            theme::WARN
+        }
+        crate::upgrade::Progress::Rebooting { .. } | crate::upgrade::Progress::Complete { .. } => {
+            theme::OK
+        }
+        crate::upgrade::Progress::Failed(_) => theme::ERR,
+        _ => theme::CYAN,
+    }
+}
+fn scroll_hint(selected: usize, capacity: usize, total: usize) -> String {
+    let start = selected.saturating_sub(capacity.saturating_sub(1));
+    if total > capacity {
+        format!(
+            " | {}–{} / {total} ↑↓ scroll{}{}",
+            start + 1,
+            (start + capacity).min(total),
+            if start > 0 { " ↑ more" } else { "" },
+            if start + capacity < total {
+                " ↓ more"
             } else {
-                files += 1;
-                total += meta.len();
-                if let Ok(m) = meta.modified() {
-                    recent.push((m, name));
-                }
+                ""
             }
+        )
+    } else {
+        format!(" | {total} devices")
+    }
+}
+fn device_mode(info: &crate::cisco::VersionInfo) -> String {
+    info.members
+        .first()
+        .map(|m| m.mode.clone())
+        .or_else(|| {
+            info.image.as_ref().map(|i| {
+                if i.ends_with("packages.conf") {
+                    "INSTALL".into()
+                } else if i.ends_with(".bin") {
+                    "BUNDLE".into()
+                } else {
+                    "?".into()
+                }
+            })
+        })
+        .unwrap_or_else(|| "?".into())
+}
+fn draw_connections(f: &mut Frame, ui: &mut Ui, area: Rect) {
+    let panes = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Min(6),
+        Constraint::Length(8),
+    ])
+    .split(area);
+    let mut header=vec![Line::from(theme::value("a: add | b: Bulk | r: Reconnect / refresh | c: CLI | Delete: remove")),Line::from(theme::label("SSH connections are shared by Transfer and Upgrade. No transfer protocol is selected here."))];
+    if let Some(scan) = ui.app.switches.scan() {
+        let p = scan.progress();
+        header.push(Line::from(theme::label(format!("Subnet {}: {}/{} checked, {} reachable | failed SSH attempts hidden; reasons in Logs | S cancels",p.subnet,p.checked,p.total,p.reachable))));
+    }
+    f.render_widget(
+        Paragraph::new(header).block(theme::panel(" CONNECT ")),
+        panes[0],
+    );
+    let switches = ui.app.switches.list();
+    ui.switch_sel = ui.switch_sel.min(switches.len().saturating_sub(1));
+    let capacity = panes[1].height.saturating_sub(3) as usize;
+    let start = ui.switch_sel.saturating_sub(capacity.saturating_sub(1));
+    let rows = switches
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(capacity)
+        .map(|(i, sw)| {
+            let facts = sw.facts();
+            let info = facts.version.unwrap_or_default();
+            let state = sw.state();
+            Row::new(vec![
+                Cell::from(sw.display_name()),
+                Cell::from(sw.host.clone()),
+                Cell::from(info.model.clone().unwrap_or_else(|| "?".into())),
+                Cell::from(device_mode(&info)),
+                Cell::from(info.version.unwrap_or_else(|| "?".into())),
+                Cell::from(
+                    facts
+                        .flash
+                        .map(|f| crate::switch::fmt_mb(f.free))
+                        .unwrap_or_else(|| "?".into()),
+                ),
+                Cell::from(state.label()),
+            ])
+            .style(if i == ui.switch_sel {
+                theme::selected()
+            } else {
+                Style::default().fg(theme::TEXT)
+            })
+        });
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Min(17),
+                Constraint::Length(18),
+                Constraint::Length(20),
+                Constraint::Length(9),
+                Constraint::Length(14),
+                Constraint::Length(12),
+                Constraint::Length(13),
+            ],
+        )
+        .header(
+            Row::new([
+                "device",
+                "address",
+                "model",
+                "mode",
+                "version",
+                "flash free",
+                "SSH",
+            ])
+            .style(theme::header()),
+        )
+        .block(theme::panel(&format!(
+            " CONNECTIONS{} ",
+            scroll_hint(ui.switch_sel, capacity, switches.len())
+        ))),
+        panes[1],
+    );
+    let mut detail=vec![Line::from(theme::label("Select a device. Enter: session transcript | c: interactive CLI | r: reconnect with stored credentials."))];
+    if let Some(sw) = super::selected_switch(ui) {
+        let facts = sw.facts();
+        let info = facts.version.unwrap_or_default();
+        let progress = sw.upgrade();
+        detail.push(Line::from(theme::value(format!(
+            "{}:{} | user {} | uptime {}",
+            sw.host,
+            sw.port,
+            sw.connection_username(),
+            info.uptime.unwrap_or_else(|| "?".into())
+        ))));
+        detail.push(Line::from(theme::value(format!(
+            "Storage {}: {} | image: {}",
+            facts.flash_device,
+            facts
+                .flash
+                .map(|m| format!(
+                    "{} free / {} total",
+                    crate::switch::fmt_mb(m.free),
+                    crate::switch::fmt_mb(m.total)
+                ))
+                .unwrap_or_else(|| "?".into()),
+            info.image.unwrap_or_else(|| "?".into())
+        ))));
+        detail.push(Line::from(vec![
+            theme::label("Reachability: "),
+            ping_span(&sw.reach()),
+        ]));
+        if let Some(d) = ui
+            .app
+            .engine()
+            .snapshot()
+            .devices
+            .into_iter()
+            .find(|d| d.id == sw.id)
+        {
+            detail.push(Line::from(theme::value(format!(
+                "SSH: {} · {} retry attempts",
+                d.recovery.label(),
+                d.recovery.attempts
+            ))));
+        }
+        detail.push(Line::from(Span::styled(
+            progress.label(),
+            Style::default().fg(reboot_color(&progress)),
+        )));
+        if let SwitchState::Failed { reason } | SwitchState::Offline { reason } = sw.state() {
+            detail.push(Line::from(Span::styled(
+                reason,
+                Style::default().fg(theme::ERR),
+            )));
         }
     }
-    recent.sort_by(|a, b| b.0.cmp(&a.0));
-    let recent = recent.into_iter().take(4).map(|(_, n)| n).collect();
-    (files, dirs, total, recent)
+    f.render_widget(
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: false })
+            .block(theme::panel(" DEVICE DETAILS ")),
+        panes[2],
+    );
 }
 
 fn draw_services(f: &mut Frame, ui: &Ui, area: Rect) {
-    let chunks = Layout::vertical([Constraint::Min(7), Constraint::Length(9)]).split(area);
+    let chunks = Layout::vertical([Constraint::Length(9), Constraint::Min(0)]).split(area);
     let cfg = ui.app.config.read().unwrap();
     let rows: Vec<Row> = ServiceId::ALL
         .iter()
@@ -538,7 +441,7 @@ fn draw_services(f: &mut Frame, ui: &Ui, area: Rect) {
     )
     .header(Row::new(vec!["on", "service", "status", "listen", "note"]).style(theme::header()))
     .block(theme::panel(
-        " SERVICES — Space on/off, s start/stop, Enter edit ",
+        " SERVICES — ↑↓ select / Space on/off / s start-stop / Enter edit ",
     ));
     f.render_widget(table, chunks[0]);
 
@@ -628,88 +531,256 @@ fn ssh_info(cfg: &crate::config::Config) -> String {
     .clone()
 }
 
+fn transfer_panel(title: &str, focused: bool) -> Block<'_> {
+    theme::panel(title).border_style(Style::default().fg(if focused {
+        theme::ACCENT
+    } else {
+        theme::DIM
+    }))
+}
+
+fn draw_transfer_entries(
+    f: &mut Frame,
+    entries: &[super::FileEntry],
+    selected: usize,
+    focused: bool,
+    title: &str,
+    error: Option<&str>,
+    area: Rect,
+) {
+    let height = area.height.saturating_sub(3) as usize;
+    let offset = selected.saturating_sub(height.saturating_sub(1));
+    let rows = entries
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(height)
+        .map(|(i, e)| {
+            Row::new(vec![
+                Cell::from(format!("{}{}", e.name, if e.is_dir { "/" } else { "" })),
+                Cell::from(if e.is_dir {
+                    "dir".into()
+                } else {
+                    fmt_bytes(e.size)
+                }),
+                Cell::from(e.ext.clone()),
+            ])
+            .style(if i == selected && focused {
+                theme::selected()
+            } else {
+                Style::default().fg(if e.is_dir {
+                    theme::CYAN
+                } else if crate::upgrade::ios_file(&e.name) {
+                    theme::WARN
+                } else {
+                    theme::TEXT
+                })
+            })
+        });
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Min(12),
+                Constraint::Length(10),
+                Constraint::Length(5),
+            ],
+        )
+        .header(Row::new(["name", "size", "type"]).style(theme::header()))
+        .block(transfer_panel(title, focused)),
+        area,
+    );
+    if let Some(error) = error {
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(2),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(3),
+        };
+        f.render_widget(
+            Paragraph::new(error)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(theme::WARN)),
+            inner,
+        );
+    }
+}
+
 fn draw_files(f: &mut Frame, ui: &mut Ui, area: Rect) {
-    let cfg = ui.app.config.read().unwrap();
+    let sections = Layout::vertical([
+        Constraint::Length(13.min(area.height.saturating_sub(10)).max(4)),
+        Constraint::Min(4),
+        Constraint::Length(3),
+    ])
+    .split(area);
+    let switches = ui.app.switches.list();
+    let capacity = sections[0].height.saturating_sub(3) as usize;
+    let offset = ui.switch_sel.saturating_sub(capacity.saturating_sub(1));
+    let rows = switches
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(capacity)
+        .map(|(i, sw)| {
+            Row::new(vec![
+                Cell::from(if i == ui.switch_sel { ">" } else { " " }),
+                Cell::from(sw.display_name()),
+                Cell::from(sw.host.clone()),
+                Cell::from(sw.state().label()),
+                Cell::from(if sw.protocol_chosen() {
+                    sw.protocol().label()
+                } else {
+                    "choose"
+                }),
+                Cell::from(
+                    sw.facts()
+                        .version
+                        .and_then(|v| v.model)
+                        .unwrap_or_else(|| "?".into()),
+                ),
+            ])
+            .style(if i == ui.switch_sel && ui.transfer_ui.focus == 0 {
+                theme::selected()
+            } else {
+                Style::default().fg(theme::TEXT)
+            })
+        });
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(2),
+                Constraint::Min(15),
+                Constraint::Length(18),
+                Constraint::Length(12),
+                Constraint::Length(9),
+                Constraint::Min(16),
+            ],
+        )
+        .header(
+            Row::new(["", "device", "address", "state", "protocol", "platform"])
+                .style(theme::header()),
+        )
+        .block(transfer_panel(
+            &format!(
+                " DEVICES — connections: 2 / p protocol{} ",
+                scroll_hint(ui.switch_sel, capacity, switches.len())
+            ),
+            ui.transfer_ui.focus == 0,
+        )),
+        sections[0],
+    );
+    if switches.is_empty() {
+        f.render_widget(
+            Paragraph::new("Connect devices in 2 Connect to use them here.")
+                .style(Style::default().fg(theme::DIM)),
+            Rect {
+                x: sections[0].x + 1,
+                y: sections[0].y + 2,
+                width: sections[0].width.saturating_sub(2),
+                height: 1,
+            },
+        );
+    }
+    let panes = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(sections[1]);
+    let local: Vec<_> = ui.files.visible().into_iter().cloned().collect();
     let title = format!(
-        " /{}  (sort: {}{}) ",
+        " LOCAL /{} — {}{} ",
         ui.files.cwd,
         ui.files.sort.label(),
         if ui.files.filter.is_empty() {
             String::new()
         } else {
-            format!(", filter: \"{}\"", ui.files.filter)
+            format!(", filter: {}", ui.files.filter)
         }
     );
-    let visible: Vec<super::FileEntry> = ui.files.visible().into_iter().cloned().collect();
-    let height = area.height.saturating_sub(3) as usize;
-    let offset = ui.files.selected.saturating_sub(height.saturating_sub(1));
-    let rows: Vec<Row> = visible
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(height.max(1))
-        .map(|(i, e)| {
-            let style = if i == ui.files.selected {
-                theme::selected()
-            } else if e.is_dir {
-                Style::default().fg(theme::CYAN)
-            } else {
-                Style::default().fg(theme::TEXT)
-            };
-            let modified = e
-                .modified
-                .map(|t| {
-                    DateTime::<Local>::from(t)
-                        .format("%Y-%m-%d %H:%M")
-                        .to_string()
-                })
-                .unwrap_or_default();
-            let rel = if ui.files.cwd.is_empty() {
-                format!("/{}", e.name)
-            } else {
-                format!("/{}/{}", ui.files.cwd, e.name)
-            };
-            Row::new(vec![
-                Cell::from(format!("{}{}", e.name, if e.is_dir { "/" } else { "" })),
-                Cell::from(if e.is_dir {
-                    "-".into()
-                } else {
-                    fmt_bytes(e.size)
-                }),
-                Cell::from(modified),
-                Cell::from(if e.is_dir {
-                    "dir".into()
-                } else {
-                    e.ext.clone()
-                }),
-                Cell::from(rel),
-            ])
-            .style(style)
-        })
-        .collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(24),
-            Constraint::Length(10),
-            Constraint::Length(17),
-            Constraint::Length(6),
-            Constraint::Min(20),
-        ],
-    )
-    .header(
-        Row::new(vec!["name", "size", "modified", "type", "download path"]).style(theme::header()),
-    )
-    .block(theme::panel(&title));
-    f.render_widget(table, area);
-    if let Some(err) = &ui.files.error {
-        let p = Paragraph::new(err.clone()).style(Style::default().fg(theme::ERR));
-        let mut inner = area;
-        inner.y = area.y + 1;
-        inner.height = 1;
-        f.render_widget(p, inner);
+    draw_transfer_entries(
+        f,
+        &local,
+        ui.files.selected,
+        ui.transfer_ui.focus == 1,
+        &title,
+        ui.files.error.as_deref(),
+        panes[0],
+    );
+    let sw = super::selected_switch(ui);
+    let path = super::remote_path(ui);
+    let listing = sw.as_ref().and_then(|s| s.listing(&path));
+    let mut remote = Vec::new();
+    if !ui.transfer_ui.remote_cwd.is_empty() {
+        remote.push(super::FileEntry {
+            name: "..".into(),
+            is_dir: true,
+            size: 0,
+            modified: None,
+            ext: String::new(),
+        });
     }
-    drop(cfg);
+    let error = match listing {
+        Some(Ok(entries)) => {
+            remote.extend(entries.into_iter().map(|e| super::FileEntry {
+                name: e.name,
+                is_dir: e.is_dir,
+                size: e.size,
+                modified: None,
+                ext: String::new(),
+            }));
+            None
+        }
+        Some(Err(e)) => Some(e),
+        None => Some(if sw.is_none() {
+            "Connect a device to browse remote storage.".into()
+        } else {
+            "Waiting for remote directory listing…".into()
+        }),
+    };
+    ui.transfer_ui.remote_selected = ui
+        .transfer_ui
+        .remote_selected
+        .min(remote.len().saturating_sub(1));
+    draw_transfer_entries(
+        f,
+        &remote,
+        ui.transfer_ui.remote_selected,
+        ui.transfer_ui.focus == 2,
+        &format!(" REMOTE {path} "),
+        error.as_deref(),
+        panes[1],
+    );
+    let direction = if ui.transfer_ui.focus == 2 {
+        "REMOTE → LOCAL"
+    } else {
+        "LOCAL → REMOTE"
+    };
+    let mut detail = format!(
+        "t: {direction} via {} | p: protocol | Enter: open/copy | Backspace: up | Home: root",
+        sw.as_ref()
+            .map(|s| s.protocol().label())
+            .unwrap_or("choose")
+    );
+    if let Some(sw) = sw {
+        if let Some(transfer) = sw.transfer(&ui.app.sessions) {
+            let state = transfer
+                .session
+                .as_ref()
+                .map(|s| format!("{} / {} bytes", s.bytes, transfer.size))
+                .unwrap_or_else(|| {
+                    if transfer.ended.is_some() {
+                        "finished".into()
+                    } else {
+                        "waiting for data".into()
+                    }
+                });
+            detail.push_str(&format!(" | {}: {state}", transfer.rel_path));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: false })
+            .block(theme::panel(" TRANSFER ")),
+        sections[2],
+    );
 }
 
 fn draw_sessions(f: &mut Frame, ui: &mut Ui, area: Rect) {
@@ -936,7 +1007,7 @@ fn draw_logs(f: &mut Frame, ui: &mut Ui, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(theme::panel(&title)), area);
 }
 
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+pub(super) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let w = width.min(area.width.saturating_sub(2));
     let h = height.min(area.height.saturating_sub(2));
     Rect::new(
@@ -953,86 +1024,82 @@ type KeyRows = &'static [(&'static str, &'static str)];
 /// Left help table.
 const HELP_LEFT: &[(&str, KeyRows)] = &[
     (
-        "SERVICES (2)",
+        "DASHBOARD (1)",
         &[
+            ("Tab", "services / transfer monitor"),
             ("↑ ↓", "select service"),
-            ("Enter", "edit popup"),
+            ("Enter", "edit service"),
             ("Space", "enable / disable"),
-            ("s", "start / stop"),
-            ("r", "restart"),
-            ("S", "start all enabled"),
-            ("X", "stop all"),
-            ("p", "port"),
-            ("b", "bind address"),
-            ("n", "username"),
-            ("w", "password"),
-            ("u", "uploads on / off"),
-            ("d", "upload directory"),
-            ("L", "logs of this service"),
+            ("s / r", "start-stop / restart"),
+            ("S / X", "start enabled / stop all"),
+            ("p / b", "port / bind address"),
+            ("n / w", "username / password"),
+            ("u / d", "uploads / upload directory"),
+            ("i / L", "URL address / service logs"),
         ],
     ),
     (
-        "FILES (3)",
+        "CONNECT (2)",
         &[
-            ("↑ ↓", "select entry"),
-            ("Enter", "open dir / cisco cmds"),
-            ("Bksp", "parent directory"),
-            ("d", "deploy to a switch"),
-            ("y", "copy cisco command"),
+            ("a / b", "add / bulk or subnet"),
+            ("Enter", "device console"),
+            ("c", "interactive switch CLI"),
+            ("Esc", "leave interactive CLI"),
+            ("r", "refresh / reconnect"),
+            ("x / X", "disconnect / clear closed"),
+            ("S", "cancel subnet scan"),
+            ("y", "trust SSH host key"),
+        ],
+    ),
+    (
+        "TRANSFER (3)",
+        &[
+            ("Tab", "devices / local / remote"),
+            ("↑ ↓", "select device or entry"),
+            ("Enter", "open dir / copy file"),
+            ("⌫/Home", "parent / root directory"),
+            ("t / p", "transfer / choose protocol"),
+            ("Del/D", "delete remote; y confirms"),
             ("H", "hashes + compare"),
-            ("s", "cycle sort order"),
+            ("s / R", "sort / refresh listing"),
             ("/", "filter by name"),
-            ("R", "refresh listing"),
         ],
-    ),
-    (
-        "UPGRADE (6)",
-        &[
-            ("a / b", "add device / bulk import"),
-            ("f / d", "choose file / deploy"),
-            ("i / S", "cleanup / cancel scan"),
-            ("Tab", "menu / devices"),
-        ],
-    ),
-    (
-        "SESSIONS (4)",
-        &[("↑ ↓", "select session"), ("B", "bit/s ⇄ byte/s")],
     ),
 ];
-
-/// Right help table.
 const HELP_RIGHT: &[(&str, KeyRows)] = &[
     (
         "GLOBAL",
         &[
-            ("1", "dashboard"),
-            ("2", "services"),
-            ("3", "files"),
-            ("4", "sessions"),
-            ("5", "logs"),
-            ("6", "upgrade"),
-            ("← →", "previous / next view"),
-            ("Tab", "next view"),
-            ("h", "this help"),
-            ("i", "address used in URLs"),
+            ("J", "jobs: cancel / retry / resume"),
+            ("1–5", "select tab"),
+            ("h / ?", "this help"),
             ("m", "sound on / off"),
-            ("q", "quit"),
-            ("^C", "quit"),
+            ("q / ^C", "quit"),
         ],
     ),
     (
-        "DEPLOY (d) + UPGRADE (6)",
+        "UPGRADE (4)",
         &[
-            ("↑ ↓", "form field / session"),
-            ("^S", "start selected server"),
+            ("Tab", "file browser / device jobs"),
+            ("Enter", "choose file / device actions"),
+            ("a / A", "assign image to one / all"),
+            ("p", "choose transfer protocol"),
+            ("d / V", "deploy / verify existing"),
+            ("u", "install; confirm reload"),
+            ("Y", "YOLO; automatic reload"),
+            ("i", "install remove inactive"),
+            ("v", "device console / confirmation"),
+            ("⌫/Home", "parent / root directory"),
+        ],
+    ),
+    (
+        "CONSOLE / CONNECTION FORM",
+        &[
+            ("↑ ↓", "scroll / form field"),
+            ("Enter", "next field / submit"),
             ("^Enter", "submit from any field"),
-            ("← →", "protocol / toggle"),
-            ("Enter", "protocol / submit / open"),
-            ("r", "re-read dir + version"),
-            ("x", "disconnect"),
-            ("X", "clear closed rows"),
-            ("c / x", "abort / disconnect"),
-            ("y", "trust the host key"),
+            ("y", "confirm reload / cleanup"),
+            ("Esc", "close / decline confirmation"),
         ],
     ),
     (
@@ -1144,7 +1211,7 @@ fn draw_deploy(f: &mut Frame, ui: &Ui) {
         .area()
         .height
         .saturating_sub(2)
-        .min(super::deploy_fields(ui.deploy_mode).len() as u16 + 12);
+        .min(super::deploy_fields(ui.deploy_mode).len() as u16 + 14);
     let area = centered_rect(width, height, f.area());
     f.render_widget(Clear, area);
     let title = match ui.deploy_mode {
@@ -1180,13 +1247,6 @@ fn draw_deploy(f: &mut Frame, ui: &Ui) {
                 }
             }
             DeployField::Destination => view.form.dest.clone(),
-            DeployField::ScanSubnet => {
-                if view.form.scan_subnet {
-                    "yes — experimental IPv4 ping sweep".into()
-                } else {
-                    "no".into()
-                }
-            }
             DeployField::Overwrite => {
                 if view.form.overwrite {
                     "yes".into()
@@ -1195,7 +1255,6 @@ fn draw_deploy(f: &mut Frame, ui: &Ui) {
                 }
             }
             DeployField::Submit => match ui.deploy_mode {
-                super::DeployMode::Bulk if view.form.scan_subnet => "[ Enter ]  Scan subnet".into(),
                 super::DeployMode::Bulk => "[ Enter ]  Add devices".into(),
                 _ => "[ Enter ]  Add device".into(),
             },
@@ -1230,11 +1289,7 @@ fn draw_deploy(f: &mut Frame, ui: &Ui) {
                 format!(
                     " {:<18}",
                     if *field == DeployField::Host && ui.deploy_mode == super::DeployMode::Bulk {
-                        if view.form.scan_subnet {
-                            "IPv4 subnet / CIDR"
-                        } else {
-                            "device IPs"
-                        }
+                        "device IP / Subnet:"
                     } else {
                         field.label()
                     }
@@ -1263,6 +1318,19 @@ fn draw_deploy(f: &mut Frame, ui: &Ui) {
         ]));
     }
     if ui.deploy_mode == super::DeployMode::Copy {
+        if ui.tab == Tab::Upgrade {
+            if let Some(warning) = open_session
+                .as_ref()
+                .and_then(|s| s.facts().version)
+                .as_ref()
+                .and_then(|v| crate::cisco::platform_warning(v, &view.rel_path))
+            {
+                lines.push(Line::from(Span::styled(
+                    warning,
+                    Style::default().fg(theme::WARN).bold(),
+                )));
+            }
+        }
         // What the device has room for, when a session already told us.
         if let Some(usage) = open_session.as_ref().and_then(|s| s.facts().flash) {
             let fits = usage.fits(view.size);
@@ -1294,18 +1362,14 @@ fn draw_deploy(f: &mut Frame, ui: &Ui) {
     } else {
         lines.push(Line::from(""));
         if ui.deploy_mode == super::DeployMode::Bulk {
-            lines.push(Line::from(theme::label(if view.form.scan_subnet {
-                " Experimental: 192.168.10.0/24; 32 parallel pings, SSH only to responding IPs."
-            } else {
-                " IPs: spaces, commas, semicolons or pasted newlines. Credentials apply to all devices."
-            })));
+            lines.push(Line::from(theme::label(" IPs and/or subnets: 192.168.22.0/24, 192.168.11.11; credentials apply to all devices.")));
             lines.push(Line::from(Span::styled(
-                " Bulk/scan automatically trusts unknown AND changed SSH host keys.",
+                " Host-key acceptance follows saved settings (automatic by default).",
                 Style::default().fg(theme::WARN),
             )));
         }
         lines.push(Line::from(theme::label(
-            " Checks SSH and reads device facts. Start the file deploy separately with d.",
+            " Opens and maintains SSH; transfer protocols are selected in Transfer or Upgrade.",
         )));
     }
     if ui.pending_deploy.is_some() {
@@ -1325,7 +1389,11 @@ fn draw_deploy(f: &mut Frame, ui: &Ui) {
         theme::key("↑↓"),
         theme::label(" field  "),
         theme::key("←→/Space"),
-        theme::label(" protocol, overwrite  "),
+        theme::label(if ui.deploy_mode == super::DeployMode::Copy {
+            " protocol, overwrite  "
+        } else {
+            " "
+        }),
         theme::key("Enter"),
         theme::label(if ui.deploy_mode == super::DeployMode::Copy {
             " protocol / submit  "
@@ -1360,6 +1428,18 @@ fn draw_session(f: &mut Frame, ui: &Ui) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    if let SwitchState::ReloadConfirm { prompt } = switch.state() {
+        f.render_widget(
+            Paragraph::new(format!(
+                "\nDevice: {} ({})\n\n{prompt}\n\nThe device will reboot. y: confirm reload | any other key: decline",
+                switch.display_name(), switch.host
+            ))
+            .wrap(Wrap { trim: false })
+            .block(theme::panel_double(" CONFIRM RELOAD ")),
+            area,
+        );
+        return;
+    }
     if let SwitchState::HostKey { fingerprint } = switch.state() {
         draw_host_key(f, switch, &fingerprint, inner);
         return;
@@ -1420,15 +1500,18 @@ fn draw_session(f: &mut Frame, ui: &Ui) {
         return;
     }
 
+    let mut summary = switch_summary(switch);
+    summary.extend(transfer_summary(ui, switch));
+    let summary_height = (summary.len() as u16)
+        .max(7)
+        .min(inner.height.saturating_sub(5));
     let chunks = Layout::vertical([
-        Constraint::Length(7),
+        Constraint::Length(summary_height),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
     .split(inner);
 
-    let mut summary = switch_summary(switch);
-    summary.extend(transfer_summary(ui, switch));
     f.render_widget(
         Paragraph::new(summary).wrap(Wrap { trim: false }),
         chunks[0],
@@ -1520,6 +1603,17 @@ fn switch_summary(switch: &crate::switch::Switch) -> Vec<Line<'static>> {
         theme::label(" state    "),
         Span::styled(state_text, Style::default().fg(state_color).bold()),
     ])];
+
+    let progress = switch.upgrade();
+    if !matches!(progress, crate::upgrade::Progress::Idle) {
+        lines.push(Line::from(vec![
+            theme::label(" upgrade  "),
+            Span::styled(
+                progress.label(),
+                Style::default().fg(reboot_color(&progress)).bold(),
+            ),
+        ]));
+    }
 
     let version = facts.version.clone().unwrap_or_default();
     lines.push(Line::from(vec![
@@ -1646,321 +1740,328 @@ fn draw_host_key(f: &mut Frame, switch: &crate::switch::Switch, fingerprint: &st
 
 /// The switches view: one row per open SSH session to a device.
 fn draw_switches(f: &mut Frame, ui: &mut Ui, area: Rect) {
-    let panes = Layout::horizontal([
-        Constraint::Length(if area.width < 105 { 0 } else { 23 }),
-        Constraint::Min(30),
+    let sections = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Percentage(38),
+        Constraint::Min(6),
+        Constraint::Length(7),
     ])
     .split(area);
-    let mut menu = Vec::new();
-    for (i, label) in super::UPGRADE_ACTIONS.iter().enumerate() {
-        menu.push(Line::from(Span::styled(
-            format!(
-                " {} {label}",
-                if ui.upgrade_menu == Some(i) { ">" } else { " " }
-            ),
-            if ui.upgrade_menu == Some(i) {
+    let protocol = ui.upgrade_protocol;
+    let service = ui.app.services.status(crate::cisco::service_of(protocol));
+    let selected = ui
+        .upgrade_file
+        .as_ref()
+        .map(|(p, _)| p.as_str())
+        .unwrap_or("select a file above");
+    f.render_widget(Paragraph::new(vec![Line::from(theme::value(format!("Protocol: {} [{}] — p selects | file: /{selected}",protocol.label(),service))),Line::from(theme::label("Tab: files / jobs | Enter: choose file | a: assign selected device | A: assign all | d: deploy + MD5"))]).block(theme::panel(" UPGRADE — INSTALL MODE ")),sections[0]);
+    let files: Vec<_> = ui.files.visible().into_iter().cloned().collect();
+    draw_transfer_entries(
+        f,
+        &files,
+        ui.files.selected,
+        ui.upgrade_menu.is_some(),
+        &format!(
+            " FILE BROWSER /{} — Backspace up / Home root ",
+            ui.files.cwd
+        ),
+        ui.files.error.as_deref(),
+        sections[1],
+    );
+    let switches = ui.app.switches.list();
+    let capacity = (sections[2].height.saturating_sub(3) as usize / 2).max(1);
+    let offset = ui.switch_sel.saturating_sub(capacity.saturating_sub(1));
+    // Match the fixed final table column, accounting for the frame and header.
+    if sections[2].width >= 110 {
+        let x = sections[2].right().saturating_sub(25);
+        for (row, sw) in switches.iter().skip(offset).take(capacity).enumerate() {
+            let y = sections[2].y + 2 + row as u16 * 2;
+            if y + 1 >= sections[2].bottom().saturating_sub(1) {
+                break;
+            }
+            let info = sw.facts().version.unwrap_or_default();
+            let progress = sw.upgrade();
+            let allowed = sw.state() == SwitchState::Ready
+                && crate::upgrade::install_blocker(&progress, &info).is_none();
+            if allowed {
+                ui.upgrade_buttons.push(super::UpgradeButton {
+                    area: Rect::new(x, y, 11, 1),
+                    switch: sw.clone(),
+                    action: 2,
+                });
+            } else if !matches!(
+                progress,
+                crate::upgrade::Progress::Verified { .. }
+                    | crate::upgrade::Progress::Complete { .. }
+            ) {
+                ui.upgrade_buttons.push(super::UpgradeButton {
+                    area: Rect::new(x, y, 10, 1),
+                    switch: sw.clone(),
+                    action: 0,
+                });
+                ui.upgrade_buttons.push(super::UpgradeButton {
+                    area: Rect::new(x + 11, y, 10, 1),
+                    switch: sw.clone(),
+                    action: 1,
+                });
+            }
+            let assigned = ui
+                .upgrade_assignments
+                .get(&sw.id)
+                .or(ui.upgrade_file.as_ref());
+            let no_space = assigned
+                .zip(sw.facts().flash)
+                .is_some_and(|((_, size), flash)| !flash.fits(*size));
+            ui.upgrade_buttons.push(super::UpgradeButton {
+                area: Rect::new(x, y + 1, if no_space { 19 } else { 16 }, 1),
+                switch: sw.clone(),
+                action: if no_space { 4 } else { usize::MAX },
+            });
+        }
+    }
+    let rows = switches
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(capacity)
+        .map(|(i, sw)| {
+            let facts = sw.facts();
+            let info = facts.version.clone().unwrap_or_default();
+            let progress = sw.upgrade();
+            let assigned = ui
+                .upgrade_assignments
+                .get(&sw.id)
+                .or(ui.upgrade_file.as_ref());
+            let no_space = assigned
+                .zip(facts.flash)
+                .is_some_and(|((_, size), flash)| !flash.fits(*size));
+            let allowed = sw.state() == SwitchState::Ready
+                && crate::upgrade::install_blocker(&progress, &info).is_none();
+            let (percent, speed, eta) =
+                upgrade_metrics(ui, sw, assigned.map(|(path, _)| path.as_str()));
+            let action = if allowed {
+                "[u Upgrade]"
+            } else if matches!(
+                progress,
+                crate::upgrade::Progress::Verified { .. }
+                    | crate::upgrade::Progress::Complete { .. }
+            ) {
+                "[Upgrade disabled]"
+            } else {
+                "[d Deploy] [V Verify]"
+            };
+            let extra = if no_space {
+                "[i Remove inactive]"
+            } else {
+                "[Enter: actions]"
+            };
+            Row::new(vec![
+                Cell::from(Text::from(vec![
+                    Line::from(sw.display_name()),
+                    Line::from(info.model.unwrap_or_else(|| "?".into())),
+                ])),
+                Cell::from(Text::from(vec![
+                    Line::from(
+                        assigned
+                            .map(|(p, _)| p.clone())
+                            .unwrap_or_else(|| "assign image: a / A".into()),
+                    ),
+                    Line::from(Span::styled(
+                        format!(
+                            "IOS {} | {}",
+                            info.version.unwrap_or_else(|| "?".into()),
+                            progress.label()
+                        ),
+                        Style::default().fg(reboot_color(&progress)),
+                    )),
+                ])),
+                Cell::from(Text::from(vec![
+                    Line::from(
+                        facts
+                            .flash
+                            .map(|f| crate::switch::fmt_mb(f.free))
+                            .unwrap_or_else(|| "?".into()),
+                    ),
+                    Line::from(Span::styled(
+                        if no_space { "NO SPACE" } else { "" },
+                        Style::default().fg(theme::ERR),
+                    )),
+                ])),
+                Cell::from(Text::from(vec![
+                    Line::from(format!("{percent} | {speed}")),
+                    Line::from(format!("ETA {eta}")),
+                ])),
+                Cell::from(Text::from(vec![
+                    Line::from(Span::styled(
+                        action,
+                        Style::default().fg(if allowed { theme::OK } else { theme::CYAN }),
+                    )),
+                    Line::from(Span::styled(
+                        extra,
+                        Style::default().fg(if no_space { theme::ERR } else { theme::DIM }),
+                    )),
+                ])),
+            ])
+            .height(2)
+            .style(if i == ui.switch_sel && ui.upgrade_menu.is_none() {
                 theme::selected()
             } else {
                 Style::default().fg(theme::TEXT)
-            },
-        )));
-        menu.push(Line::from(""));
-    }
-    menu.push(Line::from(theme::label(" Tab: menu / devices")));
-    menu.push(Line::from(theme::label(" Enter: select")));
-    menu.push(Line::from(theme::label(" a: Add   b: Bulk")));
-    menu.push(Line::from(theme::label(" d: Deploy selected")));
-    menu.push(Line::from(theme::label(" i: Remove inactive")));
-    menu.push(Line::from(theme::label(" S: Cancel scan")));
+            })
+        });
     f.render_widget(
-        Paragraph::new(menu)
-            .wrap(Wrap { trim: false })
-            .block(theme::panel(" UPGRADE ")),
-        panes[0],
-    );
-    let right = Layout::vertical([
-        Constraint::Length(if ui.app.switches.scan().is_some() {
-            7
-        } else {
-            4
-        }),
-        Constraint::Min(6),
-    ])
-    .split(panes[1]);
-    let mut file = match &ui.upgrade_file {
-        Some((path, size)) => vec![
-            Line::from(Span::styled(
-                format!(" /{path}"),
-                Style::default().fg(theme::CYAN).bold(),
-            )),
-            Line::from(theme::value(format!(" {}", fmt_bytes(*size)))),
-        ],
-        None => vec![Line::from(theme::label(
-            " No file selected — press f to choose one.",
-        ))],
-    };
-    if let Some(scan) = ui.app.switches.scan() {
-        let progress = scan.progress();
-        let state = if progress.cancelled {
-            "cancelled"
-        } else if progress.finished {
-            "ping sweep complete"
-        } else {
-            "scanning"
-        };
-        file.push(Line::from(Span::styled(
-            format!(
-                " SCAN {}: {state} — {}/{} pinged, {} reachable",
-                progress.subnet, progress.checked, progress.total, progress.reachable
+        Table::new(
+            rows,
+            [
+                Constraint::Min(18),
+                Constraint::Percentage(30),
+                Constraint::Length(12),
+                Constraint::Min(20),
+                Constraint::Length(24),
+            ],
+        )
+        .header(
+            Row::new([
+                "device / model",
+                "assigned image / version",
+                "flash free",
+                "upload % / speed / ETA",
+                "actions",
+            ])
+            .style(theme::header()),
+        )
+        .block(transfer_panel(
+            &format!(
+                " DEVICE JOBS{} ",
+                scroll_hint(ui.switch_sel, capacity, switches.len())
             ),
-            Style::default().fg(theme::CYAN),
+            ui.upgrade_menu.is_none(),
+        )),
+        sections[2],
+    );
+    let mut detail=vec![Line::from(theme::label("Enter: device actions | d: deploy | V: verify existing | u/Y: upgrade/YOLO | i: remove inactive | v: console"))];
+    if let Some(sw) = super::selected_switch(ui) {
+        let progress = sw.upgrade();
+        detail.push(Line::from(Span::styled(
+            progress.label(),
+            Style::default().fg(reboot_color(&progress)),
         )));
-        file.push(Line::from(theme::label(format!(
-            " Last: {} | reachable devices connect via SSH below | S: cancel scan",
-            progress.last_host
-        ))));
-        if let Some(error) = progress.error {
-            file.push(Line::from(Span::styled(
-                error,
-                Style::default().fg(theme::ERR),
+        if let Some(reason) =
+            crate::upgrade::install_blocker(&progress, &sw.facts().version.unwrap_or_default())
+        {
+            detail.push(Line::from(Span::styled(
+                reason,
+                Style::default().fg(theme::WARN),
             )));
         }
-    }
-    f.render_widget(
-        Paragraph::new(file).block(theme::panel(" SELECTED FILE / DISCOVERY ")),
-        right[0],
-    );
-    let area = right[1];
-
-    let switches = ui.app.switches.list();
-    if ui.switch_sel >= switches.len() {
-        ui.switch_sel = switches.len().saturating_sub(1);
-    }
-
-    let wide = area.width >= 155;
-    let compact = area.width < 90;
-    let labels = if wide {
-        vec![
-            "name / host",
-            "model",
-            "version",
-            "stack",
-            "flash usage",
-            "file fits",
-            "state",
-            "protocol",
-            "progress",
-            "speed",
-            "ETA",
-        ]
-    } else {
-        vec![
-            "name / host",
-            "model",
-            "version",
-            "stack",
-            "flash usage",
-            "fits",
-            "state",
-        ]
-    };
-    let header = Row::new(labels).style(theme::header());
-
-    let rows: Vec<Row> = switches
-        .iter()
-        .enumerate()
-        .map(|(i, sw)| {
-            let state = sw.state();
-            let state_style = match &state {
-                SwitchState::Ready => Style::default().fg(theme::OK),
-                SwitchState::Busy { .. } => Style::default().fg(theme::HILITE).bold(),
-                SwitchState::Failed { .. } | SwitchState::Offline { .. } => {
-                    Style::default().fg(theme::ERR)
-                }
-                _ => Style::default().fg(theme::WARN),
-            };
-            let transfer = sw.transfer(&ui.app.sessions);
-            let stats = transfer.as_ref().and_then(|t| t.session.as_ref());
-            let finished = transfer.as_ref().is_some_and(|t| t.ended.is_some());
-            let facts = sw.facts();
-            let version = facts.version.unwrap_or_default();
-            let stack_count = if !version.members.is_empty() {
-                version.members.len().to_string()
-            } else if version.version.is_some() || version.model.is_some() {
-                "1".into()
-            } else {
-                "?".into()
-            };
-            let flash = facts
-                .flash
-                .map(|usage| {
-                    if wide {
-                        format!(
-                            "{} free of {} ({:.0}% used)",
-                            crate::switch::fmt_mb(usage.free),
-                            crate::switch::fmt_mb(usage.total),
-                            usage.used_fraction() * 100.0
-                        )
-                    } else if compact {
-                        format!(
-                            "{} free\nof {}\n({:.0}% used)",
-                            crate::switch::fmt_mb(usage.free),
-                            crate::switch::fmt_mb(usage.total),
-                            usage.used_fraction() * 100.0
-                        )
+        if let Some((path, size)) = ui
+            .upgrade_assignments
+            .get(&sw.id)
+            .or(ui.upgrade_file.as_ref())
+        {
+            if let Some(usage) = sw.facts().flash {
+                detail.push(Line::from(Span::styled(
+                    format!(
+                        "Image {} | storage {} free / {} total | {}",
+                        crate::switch::fmt_mb(*size),
+                        crate::switch::fmt_mb(usage.free),
+                        crate::switch::fmt_mb(usage.total),
+                        if usage.fits(*size) {
+                            "fits"
+                        } else {
+                            "NO SPACE"
+                        }
+                    ),
+                    Style::default().fg(if usage.fits(*size) {
+                        theme::TEXT
                     } else {
-                        format!(
-                            "{} free of {}\n({:.0}% used)",
-                            crate::switch::fmt_mb(usage.free),
-                            crate::switch::fmt_mb(usage.total),
-                            usage.used_fraction() * 100.0
-                        )
-                    }
-                })
-                .unwrap_or_else(|| "unknown".into());
-            let fits = ui
-                .upgrade_file
+                        theme::ERR
+                    }),
+                )));
+            }
+            if let Some(warning) = sw
+                .facts()
+                .version
                 .as_ref()
-                .and_then(|(_, size)| facts.flash.map(|usage| usage.fits(*size)));
-            let fit_label = match fits {
-                Some(true) => "yes",
-                Some(false) => "NO SPACE",
-                None => {
-                    if ui.upgrade_file.is_some() {
-                        "unknown"
-                    } else {
-                        "no file"
-                    }
-                }
-            };
-            let mut cells = vec![
-                Cell::from(format!("{}\n{}:{}", sw.display_name(), sw.host, sw.port)),
-                Cell::from(version.model.unwrap_or_else(|| "?".into())),
-                Cell::from(version.version.unwrap_or_else(|| "?".into())),
-                Cell::from(stack_count),
-                Cell::from(flash),
-                Cell::from(fit_label).style(
-                    Style::default()
-                        .fg(match fits {
-                            Some(true) => theme::OK,
-                            Some(false) => theme::ERR,
-                            None => theme::WARN,
-                        })
-                        .bold(),
-                ),
-                Cell::from(state.label()).style(state_style),
-            ];
-            if wide {
-                cells.extend([
-                    Cell::from(sw.protocol().label()),
-                    Cell::from(
-                        stats
-                            .and_then(|s| s.progress())
-                            .map(|p| format!("{:.0}%", p * 100.0))
-                            .unwrap_or_else(|| "—".into()),
-                    ),
-                    Cell::from(
-                        stats
-                            .map(|s| {
-                                fmt_speed(
-                                    if finished { 0.0 } else { s.current_speed },
-                                    ui.app.config.read().unwrap().speed_in_bits,
-                                )
-                            })
-                            .unwrap_or_else(|| "—".into()),
-                    ),
-                    Cell::from(
-                        stats
-                            .and_then(|s| if finished { None } else { s.eta() })
-                            .map(fmt_duration)
-                            .unwrap_or_else(|| "—".into()),
-                    ),
-                ]);
+                .and_then(|v| crate::cisco::platform_warning(v, path))
+            {
+                detail.push(Line::from(Span::styled(
+                    warning,
+                    Style::default().fg(theme::WARN),
+                )));
             }
-            let row = Row::new(cells).height(if compact { 3 } else { 2 });
-            if i == ui.switch_sel && ui.upgrade_menu.is_none() {
-                row.style(theme::selected())
-            } else {
-                row
-            }
-        })
-        .collect();
-
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(11)]).split(area);
-    let mut widths = if compact {
-        vec![
-            Constraint::Min(10),
-            Constraint::Length(12),
-            Constraint::Length(9),
-            Constraint::Length(5),
-            Constraint::Length(14),
-            Constraint::Length(6),
-            Constraint::Length(7),
-        ]
-    } else {
-        vec![
-            Constraint::Min(12),
-            Constraint::Length(14),
-            Constraint::Length(10),
-            Constraint::Length(5),
-            Constraint::Length(if wide { 40 } else { 27 }),
-            Constraint::Length(8),
-            Constraint::Length(10),
-        ]
-    };
-    if wide {
-        widths.extend([
-            Constraint::Length(8),
-            Constraint::Length(9),
-            Constraint::Length(13),
-            Constraint::Length(6),
-        ]);
-    }
-    let mut table_state = TableState::default().with_selected(Some(ui.switch_sel));
-    f.render_stateful_widget(
-        Table::new(rows, widths)
-            .header(header)
-            .block(theme::panel(" DEVICES ")),
-        chunks[0],
-        &mut table_state,
-    );
-
-    let detail = match switches.get(ui.switch_sel) {
-        Some(sw) => {
-            let mut lines = switch_summary(sw);
-            lines.extend(transfer_summary(ui, sw));
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                theme::key("Enter"),
-                theme::label(" open the session   "),
-                theme::key("r"),
-                theme::label(" refresh facts   "),
-                theme::key("i"),
-                theme::label(" remove inactive   "),
-                theme::key("x"),
-                theme::label(" disconnect   "),
-                theme::key("X"),
-                theme::label(" clear closed"),
-            ]));
-            lines
         }
-        None => vec![
-            Line::from(""),
-            Line::from(theme::label(
-                "  No device yet. Add device (a) or Bulk import (b) checks SSH without starting a deploy.",
-            )),
-            Line::from(theme::label(
-                "  Choose file (f), select a device with Tab / ↑↓, then deploy separately with d.",
-            )),
-        ],
-    };
+    }
     f.render_widget(
         Paragraph::new(detail)
             .wrap(Wrap { trim: false })
-            .block(theme::panel(" DEVICE ")),
-        chunks[1],
+            .block(theme::panel(" SELECTED JOB ")),
+        sections[3],
     );
+}
+
+fn upgrade_metrics(
+    ui: &Ui,
+    sw: &crate::switch::Switch,
+    assigned: Option<&str>,
+) -> (String, String, String) {
+    let verified = matches!(
+        sw.upgrade(),
+        crate::upgrade::Progress::Verified { .. }
+            | crate::upgrade::Progress::Installing
+            | crate::upgrade::Progress::AwaitingReload { .. }
+            | crate::upgrade::Progress::Rebooting { .. }
+            | crate::upgrade::Progress::Complete { .. }
+    );
+    let transfer = sw
+        .transfer(&ui.app.sessions)
+        .filter(|t| assigned.is_some_and(|path| path == t.rel_path));
+    let bits = ui.app.config.read().unwrap().speed_in_bits;
+    if let Some(transfer) = transfer {
+        let session = transfer.session;
+        let percent = if verified {
+            "100%".into()
+        } else if let Some(session) = &session {
+            if transfer.size > 0 {
+                format!(
+                    "{:.0}%",
+                    (session.bytes as f64 / transfer.size as f64 * 100.0).min(100.0)
+                )
+            } else {
+                "—".into()
+            }
+        } else {
+            "0%".into()
+        };
+        let speed = session
+            .as_ref()
+            .map(|s| {
+                fmt_speed(
+                    if transfer.ended.is_some() {
+                        s.avg_speed()
+                    } else {
+                        s.current_speed
+                    },
+                    bits,
+                )
+            })
+            .unwrap_or_else(|| "—".into());
+        let eta = if transfer.ended.is_none() {
+            session
+                .and_then(|s| s.eta())
+                .map(fmt_duration)
+                .unwrap_or_else(|| "—".into())
+        } else {
+            "—".into()
+        };
+        (percent, speed, eta)
+    } else {
+        (
+            if verified { "100%" } else { "—" }.into(),
+            "—".into(),
+            "—".into(),
+        )
+    }
 }
 
 fn draw_file_picker(f: &mut Frame, ui: &Ui, area: Rect) {
@@ -2063,6 +2164,91 @@ fn transfer_summary(ui: &Ui, switch: &crate::switch::Switch) -> Vec<Line<'static
 fn draw_modal(f: &mut Frame, ui: &Ui) {
     let Some(modal) = &ui.modal else { return };
     match modal {
+        Modal::Workflow => super::workflow::draw(f, ui),
+        Modal::WorkflowLogin { form, .. } => super::workflow::draw_login(f, form),
+        Modal::CoreQuestion(question) => {
+            let area = centered_rect(100, 12, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(format!(
+                    "{:?}\n\nType lowercase y to confirm. Any other key cancels.",
+                    question.kind
+                ))
+                .block(theme::panel(" CONFIRM "))
+                .wrap(Wrap { trim: false }),
+                area,
+            );
+        }
+        Modal::Jobs { selected } => {
+            let snapshot = ui.app.engine().snapshot();
+            let jobs: Vec<_> = snapshot
+                .operations
+                .iter()
+                .filter(|o| o.transfer.is_some())
+                .collect();
+            let area = centered_rect(110, f.area().height.saturating_sub(4).max(8), f.area());
+            f.render_widget(Clear, area);
+            let rows = area.height.saturating_sub(5) as usize;
+            let start = selected.saturating_sub(rows.saturating_sub(1));
+            let mut lines = vec![
+                Line::from(
+                    " ↑↓ select · v inspect · r retry · o overwrite · c cancel · s check · S resume checked · Esc close",
+                ),
+                Line::from(""),
+            ];
+            for (index, operation) in jobs.iter().enumerate().skip(start).take(rows) {
+                let transfer = operation.transfer.as_ref().unwrap();
+                let name = snapshot
+                    .devices
+                    .iter()
+                    .find(|d| Some(d.id) == operation.device)
+                    .map(|d| d.name.as_str())
+                    .unwrap_or("removed device");
+                let text = format!(
+                    "{} #{:03} {} · {} · {} {} → {}",
+                    if index == *selected { "▸" } else { " " },
+                    operation.id,
+                    name,
+                    operation.state.label(),
+                    transfer.protocol.label(),
+                    if transfer.receive {
+                        &transfer.remote
+                    } else {
+                        &transfer.local
+                    },
+                    if transfer.receive {
+                        &transfer.local
+                    } else {
+                        &transfer.remote
+                    }
+                );
+                lines.push(Line::from(Span::styled(
+                    text,
+                    Style::default().fg(if operation.state.error().is_some() {
+                        theme::ERR
+                    } else if index == *selected {
+                        theme::ACCENT
+                    } else {
+                        theme::TEXT
+                    }),
+                )));
+            }
+            if jobs.is_empty() {
+                lines.push(Line::from(" No transfer jobs in this session."));
+            }
+            if let Some(error) = jobs.get(*selected).and_then(|o| o.state.error()) {
+                lines.push(Line::from(Span::styled(
+                    error.to_string(),
+                    Style::default().fg(theme::ERR),
+                )));
+            }
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(theme::panel(" JOBS · session only "))
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+        }
         Modal::Help => draw_help(f, ui.help_scroll),
         Modal::ConfirmQuit => {
             let running = ServiceId::ALL
@@ -2342,6 +2528,188 @@ fn draw_modal(f: &mut Frame, ui: &Ui) {
             f.render_widget(block, area);
             draw_file_picker(f, ui, inner);
         }
+        Modal::TransferProtocol {
+            options,
+            selected,
+            upgrade,
+            ..
+        } => {
+            let area = centered_rect(64, options.len() as u16 + 5, f.area());
+            f.render_widget(Clear, area);
+            let mut lines = vec![Line::from(theme::label(
+                "Enabled / running services first. Enter selects; Esc cancels.",
+            ))];
+            for (i, protocol) in options.iter().enumerate() {
+                let status = ui.app.services.status(crate::cisco::service_of(*protocol));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} {} — {}",
+                        if i == *selected { ">" } else { " " },
+                        protocol.label(),
+                        status
+                    ),
+                    if i == *selected {
+                        theme::selected()
+                    } else {
+                        status_style(&status)
+                    },
+                )));
+            }
+            f.render_widget(
+                Paragraph::new(lines).block(theme::panel_double(if *upgrade {
+                    " UPGRADE PROTOCOL "
+                } else {
+                    " TRANSFER PROTOCOL "
+                })),
+                area,
+            );
+        }
+        Modal::ConfirmDelete {
+            switch,
+            path,
+            recursive,
+            ..
+        } => {
+            let area = centered_rect(86, 12, f.area());
+            f.render_widget(Clear, area);
+            let lines = vec![
+                Line::from(""),
+                Line::from(format!(
+                    "Device: {} ({})",
+                    switch.display_name(),
+                    switch.host
+                )),
+                Line::from(format!(
+                    "{}: {path}",
+                    if *recursive {
+                        "DIRECTORY AND ALL CONTENTS"
+                    } else {
+                        "FILE"
+                    }
+                )),
+                Line::from(""),
+                Line::from("DANGER: deletion is permanent and cannot be undone."),
+                Line::from(if *recursive {
+                    "All files and subdirectories inside this directory will be removed."
+                } else {
+                    "The selected file will be permanently removed."
+                }),
+                Line::from(""),
+                Line::from("y: permanently delete | ANY OTHER KEY: cancel"),
+            ];
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(theme::ERR).bold())
+                    .block(
+                        theme::panel_double(" CONFIRM REMOTE DELETE ")
+                            .border_style(Style::default().fg(theme::ERR)),
+                    ),
+                area,
+            );
+        }
+        Modal::UpgradeActions { switch, selected } => {
+            let area = centered_rect(86, 12, f.area());
+            f.render_widget(Clear, area);
+            let reason = crate::upgrade::install_blocker(
+                &switch.upgrade(),
+                &switch.facts().version.unwrap_or_default(),
+            );
+            let ready = switch.state() == SwitchState::Ready;
+            let mut lines = vec![Line::from(theme::value(format!(
+                "Device: {} ({})",
+                switch.display_name(),
+                switch.host
+            )))];
+            for (i, label) in super::UPGRADE_JOB_ACTIONS.iter().enumerate() {
+                let enabled = ready && (!(i == 2 || i == 3) || reason.is_none());
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} [{}]{}",
+                        if i == *selected { ">" } else { " " },
+                        label,
+                        if enabled { "" } else { " (unavailable)" }
+                    ),
+                    if i == *selected {
+                        theme::selected()
+                    } else {
+                        Style::default().fg(if enabled { theme::TEXT } else { theme::DIM })
+                    },
+                )));
+            }
+            if let Some(reason) = reason {
+                lines.push(Line::from(Span::styled(
+                    reason,
+                    Style::default().fg(theme::WARN),
+                )));
+            }
+            lines.push(Line::from(theme::label(
+                "↑↓ select | Enter opens action | Esc closes | upgrades require y confirmation",
+            )));
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(theme::panel_double(" DEVICE ACTIONS ")),
+                area,
+            );
+        }
+        Modal::ConfirmInstall { switch, yolo, .. } => {
+            let progress = switch.upgrade();
+            let remote = match progress {
+                crate::upgrade::Progress::Verified { remote, .. } => remote,
+                _ => "unverified".into(),
+            };
+
+            let running = switch
+                .facts()
+                .version
+                .and_then(|v| v.version)
+                .unwrap_or_else(|| "?".into());
+            let target = crate::upgrade::image_version(&remote).unwrap_or_else(|| "?".into());
+            let text=format!("Device: {} ({})\nImage: {remote}\nVersion: {running} → {target} | local/device MD5 matched\n\nwrite memory → install add file … activate commit{}\n\n{}\n\ny: START UPGRADE | ANY OTHER KEY: cancel",switch.display_name(),switch.host,if *yolo{" prompt-level none"}else{""},if *yolo{"YOLO: the device will reload automatically after this confirmation."}else{"You will also confirm the device's reload prompt in the console."});
+            let area = centered_rect(86, 14, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .block(theme::panel_double(" CONFIRM UPGRADE ")),
+                area,
+            );
+        }
+        Modal::Cli => {
+            let area = f.area();
+            f.render_widget(Clear, area);
+            if let Some(view) = &ui.session_view {
+                let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+                let _ = ui
+                    .app
+                    .engine()
+                    .submit(transferbuddy_core::engine::Command::ResizeCli(
+                        view.switch.id,
+                        body.height,
+                        body.width,
+                    ));
+                if let Some(screen) = view.switch.terminal_screen() {
+                    f.render_widget(TerminalGrid(&screen), body);
+                    let (row, col) = screen.cursor_position();
+                    if !screen.hide_cursor() && row < body.height && col < body.width {
+                        f.set_cursor_position((body.x + col, body.y + row));
+                    }
+                }
+            }
+            f.render_widget(
+                Paragraph::new(
+                    " INTERACTIVE SSH CLI — keys go to switch | ESC returns to TransferBuddy ",
+                )
+                .style(Style::default().fg(theme::BG).bg(theme::WARN)),
+                Rect {
+                    x: area.x,
+                    y: area.y + area.height.saturating_sub(1),
+                    width: area.width,
+                    height: 1,
+                },
+            );
+        }
         Modal::Deploy => draw_deploy(f, ui),
         Modal::Session => draw_session(f, ui),
         Modal::Hashes => {
@@ -2403,6 +2771,46 @@ fn draw_modal(f: &mut Frame, ui: &Ui) {
     }
 }
 
+struct TerminalGrid<'a>(&'a transferbuddy_core::terminal_types::Screen);
+impl ratatui::widgets::Widget for TerminalGrid<'_> {
+    fn render(self, area: Rect, buffer: &mut ratatui::buffer::Buffer) {
+        let (rows, cols) = self.0.size();
+        for row in 0..rows.min(area.height) {
+            for col in 0..cols.min(area.width) {
+                if let Some(cell) = self.0.cell(row, col) {
+                    if cell.is_wide_continuation() {
+                        continue;
+                    }
+                    let content = cell.contents();
+                    let mut style = Style::default();
+                    if let Some([r, g, b]) = transferbuddy_core::terminal::rgb(cell.fgcolor()) {
+                        style = style.fg(Color::Rgb(r, g, b));
+                    }
+                    if let Some([r, g, b]) = transferbuddy_core::terminal::rgb(cell.bgcolor()) {
+                        style = style.bg(Color::Rgb(r, g, b));
+                    }
+                    if cell.bold() {
+                        style = style.add_modifier(Modifier::BOLD)
+                    }
+                    if cell.italic() {
+                        style = style.add_modifier(Modifier::ITALIC)
+                    }
+                    if cell.underline() {
+                        style = style.add_modifier(Modifier::UNDERLINED)
+                    }
+                    if cell.inverse() {
+                        style = style.add_modifier(Modifier::REVERSED)
+                    }
+                    if let Some(out) = buffer.cell_mut((area.x + col, area.y + row)) {
+                        out.set_symbol(if content.is_empty() { " " } else { &content })
+                            .set_style(style);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2415,10 +2823,12 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let mut cfg = crate::config::Config::default();
-        cfg.config_dir = root.join(".test-config");
-        cfg.sound = false;
-        cfg.root = root;
+        let mut cfg = crate::config::Config {
+            config_dir: root.join(".test-config"),
+            sound: false,
+            root,
+            ..Default::default()
+        };
         cfg.http.enabled = true;
         cfg.http.port = 8080;
         cfg.http.bind = "0.0.0.0".into();
@@ -2438,6 +2848,7 @@ mod tests {
             switches: crate::switch::SwitchManager::new(rt.handle().clone(), logger2),
             privileged: false,
             runtime: rt.handle().clone(),
+            engine_state: Default::default(),
         });
         app.services.attach_app(&app);
         (rt, app)
@@ -2446,9 +2857,12 @@ mod tests {
     fn test_ui(app: crate::SharedApp) -> Ui {
         Ui {
             app,
+            workflow: super::super::workflow::Editor::default(),
             tab: Tab::Dashboard,
             service_sel: 0,
+            dashboard_transfers: false,
             files: super::super::FileBrowser::new(),
+            transfer_ui: super::super::TransferUi::default(),
             session_sel: 0,
             log_scroll: 0,
             log_follow: true,
@@ -2459,12 +2873,16 @@ mod tests {
             should_quit: false,
             status_msg: None,
             hashes: None,
+            hash_request: None,
             help_scroll: 0,
             deploy: None,
             session_view: None,
             switch_sel: 0,
             upgrade_menu: Some(0),
             upgrade_file: None,
+            upgrade_assignments: std::collections::HashMap::new(),
+            upgrade_protocol: crate::session::Protocol::Http,
+            upgrade_buttons: Vec::new(),
             deploy_mode: super::super::DeployMode::Copy,
             pending_deploy: None,
         }
@@ -2517,6 +2935,720 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Generate documentation screenshots from the real TUI renderer"]
+    fn tui_documentation_screenshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("IOS-images");
+        std::fs::create_dir(&root).unwrap();
+        for name in [
+            "cat9k_lite_iosxe.17.15.06.SPA.bin",
+            "cat9k_lite-rpbase.17.15.03.SPA.pkg",
+            "packages.conf",
+            "switch-backup.cfg",
+        ] {
+            std::fs::write(root.join(name), b"demonstration").unwrap();
+        }
+        let (_rt, app) = test_app(root.clone());
+        {
+            let mut config = app.config.write().unwrap();
+            for (id, port) in [
+                (ServiceId::Https, 8443),
+                (ServiceId::Ftp, 2121),
+                (ServiceId::Ssh, 2222),
+                (ServiceId::Tftp, 69),
+            ] {
+                let service = config.service_mut(id);
+                service.port = port;
+                service.bind = "0.0.0.0".into();
+                service.enabled = matches!(id, ServiceId::Ftp | ServiceId::Ssh);
+            }
+        }
+        let mut jobs = Vec::new();
+        for n in 1..=3 {
+            let mut sw = test_switch(SwitchState::Ready);
+            Arc::get_mut(&mut sw).unwrap().id = n;
+            sw.facts_for_test(|facts| {
+                facts.hostname = Some(format!("access-{n:02}"));
+                facts.flash = Some(crate::cisco::FlashUsage {
+                    total: 4_000_000_000,
+                    free: if n == 3 { 20_000 } else { 2_300_000_000 },
+                });
+            });
+            sw.test_listing(
+                "flash:",
+                vec![
+                    crate::cisco::RemoteFile {
+                        name: "logs".into(),
+                        is_dir: true,
+                        size: 0,
+                    },
+                    crate::cisco::RemoteFile {
+                        name: "packages.conf".into(),
+                        is_dir: false,
+                        size: 1124,
+                    },
+                    crate::cisco::RemoteFile {
+                        name: "startup-config".into(),
+                        is_dir: false,
+                        size: 14280,
+                    },
+                ],
+            );
+            if n == 2 {
+                sw.set_upgrade(crate::upgrade::Progress::Verified {
+                    remote: "flash:cat9k_lite_iosxe.17.15.06.SPA.bin".into(),
+                    md5: "900150983cd24fb0d6963f7d28e17f72".into(),
+                    version: Some("17.15.6".into()),
+                });
+            }
+            jobs.push(sw.test_job_receiver());
+            app.switches.add_for_test(sw);
+        }
+        app.logger.log(
+            crate::logging::Event::new(LogLevel::Info, "switch", "SSH session established")
+                .ip("10.20.30.40".parse().unwrap())
+                .device("access-01".into(), Some("C9200L-48P-4X".into())),
+        );
+        app.logger.log(
+            crate::logging::Event::new(LogLevel::Info, "http", "Remote MD5 matches local image")
+                .ip("10.20.30.40".parse().unwrap())
+                .result("verified"),
+        );
+        let mut ui = test_ui(app);
+        ui.files.refresh(&root);
+        ui.upgrade_menu = None;
+        for n in 1..=3 {
+            ui.upgrade_assignments
+                .insert(n, ("cat9k_lite_iosxe.17.15.06.SPA.bin".into(), 600_000_000));
+        }
+        let output =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/screenshots/tui");
+        for (tab, name) in [
+            (Tab::Dashboard, "dashboard"),
+            (Tab::Connect, "connect"),
+            (Tab::Files, "transfer"),
+            (Tab::Upgrade, "upgrade"),
+            (Tab::Logs, "logs"),
+        ] {
+            ui.tab = tab;
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+            super::super::screenshots::save(
+                terminal.backend().buffer(),
+                &output.join(format!("{name}.svg")),
+            );
+        }
+        ui.tab = Tab::Dashboard;
+        for (name, modal) in [("help", Modal::Help), ("service-edit", Modal::ServiceEdit {
+            id: ServiceId::Http, field: 0, editing: None,
+        }), ("cisco-copy", Modal::Cisco {
+            rel_path: "cat9k_lite_iosxe.17.15.06.SPA.bin".into(),
+            commands: vec![(crate::session::Protocol::Http,
+                "copy http://192.168.22.23:8080/cat9k_lite_iosxe.17.15.06.SPA.bin flash:".into()),
+                (crate::session::Protocol::Sftp,
+                "copy sftp://cisco:cisco123@192.168.22.23:2222/cat9k_lite_iosxe.17.15.06.SPA.bin flash:".into())],
+            selected: 0,
+            copied: false,
+        })] {
+            ui.modal = Some(modal);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+            super::super::screenshots::save(terminal.backend().buffer(), &output.join(format!("{name}.svg")));
+        }
+    }
+
+    #[test]
+    fn escape_leaves_cli_and_remote_exit_returns_without_another_key() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        let sw = test_switch(SwitchState::Busy { what: "CLI".into() });
+        let mut input = sw.test_cli_receiver();
+        ui.app.switches.add_for_test(sw.clone());
+        ui.session_view = Some(super::super::SessionView {
+            switch: sw.clone(),
+            scroll: None,
+            jobs_seen: 0,
+        });
+        ui.modal = Some(Modal::Cli);
+        super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(input.try_recv().unwrap(), b"x");
+        super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Esc));
+        assert!(ui.modal.is_none());
+        assert!(!sw.cli_open());
+        assert!(input.try_recv().is_err());
+        let _input = sw.test_cli_receiver();
+        ui.modal = Some(Modal::Cli);
+        sw.close_cli();
+        super::super::pump_session(&mut ui);
+        assert!(ui.modal.is_none());
+    }
+
+    #[test]
+    fn delete_confirmation_is_red_targets_one_entry_and_accepts_only_plain_y() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (key, modifiers, yes) in [
+            (KeyCode::Char('y'), KeyModifiers::NONE, true),
+            (KeyCode::Char('Y'), KeyModifiers::NONE, false),
+            (KeyCode::Char('y'), KeyModifiers::CONTROL, false),
+            (KeyCode::Enter, KeyModifiers::NONE, false),
+            (KeyCode::Esc, KeyModifiers::NONE, false),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (_rt, app) = test_app(dir.path().to_path_buf());
+            let mut ui = test_ui(app);
+            let sw = test_switch(SwitchState::Ready);
+            let mut jobs = sw.test_job_receiver();
+            ui.app.switches.add_for_test(sw.clone());
+            sw.test_listing(
+                "flash:",
+                vec![crate::cisco::RemoteFile {
+                    name: "folder".into(),
+                    is_dir: true,
+                    size: 10,
+                }],
+            );
+            ui.tab = Tab::Files;
+            ui.transfer_ui.focus = 2;
+            super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Delete));
+            assert!(
+                matches!(&ui.modal,Some(Modal::ConfirmDelete{path,recursive:true,..})if path=="flash:folder")
+            );
+            assert!(jobs.try_recv().is_err());
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|f| draw(f, &mut ui)).unwrap();
+            let buf = terminal.backend().buffer();
+            let warning = (0..40)
+                .find_map(|y| {
+                    let line: String = (0..120).map(|x| buf[(x, y)].symbol()).collect();
+                    line.find("DANGER")
+                        .map(|b| (line[..b].chars().count() as u16, y))
+                })
+                .unwrap();
+            assert_eq!(buf[warning].fg, theme::ERR);
+            super::super::handle_key(&mut ui, KeyEvent::new(key, modifiers));
+            if yes {
+                assert!(
+                    matches!(jobs.try_recv().unwrap().untracked(),crate::switch::Job::Delete{path,recursive:true}if path=="flash:folder")
+                );
+            } else {
+                assert!(jobs.try_recv().is_err());
+                assert!(ui.modal.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn enter_copies_local_and_remote_files_and_device_enter_selects_protocol() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "data").unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        let sw = test_switch(SwitchState::Ready);
+        let _jobs = sw.test_job_receiver();
+        ui.app.switches.add_for_test(sw.clone());
+        ui.tab = Tab::Files;
+        ui.files.refresh(dir.path());
+        super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            ui.modal,
+            Some(Modal::TransferProtocol { start: true, .. })
+        ));
+        ui.modal = None;
+        ui.transfer_ui.focus = 0;
+        super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            ui.modal,
+            Some(Modal::TransferProtocol { start: false, .. })
+        ));
+        ui.modal = None;
+        ui.transfer_ui.focus = 2;
+        sw.test_listing(
+            "flash:",
+            vec![crate::cisco::RemoteFile {
+                name: "remote.txt".into(),
+                is_dir: false,
+                size: 5,
+            }],
+        );
+        super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(&ui.modal,Some(Modal::TransferProtocol{options,start:true,..})if options==&[crate::session::Protocol::Ftp])
+        );
+    }
+
+    #[test]
+    fn active_protocols_are_sftp_https_ftp_http_in_priority_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let ui = test_ui(app);
+        let ids = [
+            ServiceId::Http,
+            ServiceId::Ftp,
+            ServiceId::Https,
+            ServiceId::Ssh,
+        ];
+        for id in ids {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let mut cfg = ui.app.config.write().unwrap();
+            let service = cfg.service_mut(id);
+            service.bind = "127.0.0.1".into();
+            service.port = port;
+            service.enabled = true;
+        }
+        for id in ids {
+            ui.app.services.start(id);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ids
+            .iter()
+            .all(|id| ui.app.services.status(*id).is_running())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                ids.map(|id| ui.app.services.status(id))
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let options = super::super::protocol_options(&ui, false);
+        assert_eq!(
+            &options[..4],
+            &[
+                crate::session::Protocol::Sftp,
+                crate::session::Protocol::Https,
+                crate::session::Protocol::Ftp,
+                crate::session::Protocol::Http
+            ]
+        );
+        assert!(!options.contains(&crate::session::Protocol::Tftp));
+        ui.app.services.stop_all();
+    }
+
+    #[test]
+    fn upgrade_metadata_actions_and_y_confirmation_are_available_per_device() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        ui.tab = Tab::Upgrade;
+        ui.upgrade_menu = None;
+        let sw = test_switch(SwitchState::Ready);
+        let mut jobs = sw.test_job_receiver();
+        ui.app.switches.add_for_test(sw.clone());
+        sw.facts_for_test(|f| {
+            f.flash = Some(crate::cisco::FlashUsage {
+                free: 1,
+                total: 100,
+            })
+        });
+        ui.upgrade_assignments
+            .insert(sw.id, ("cat9k_lite_iosxe.17.15.06.SPA.bin".into(), 10));
+        let screen = render_ui(&mut ui);
+        for text in [
+            "C9200L-48P-4X",
+            "flash free",
+            "ETA",
+            "upload %",
+            "[i Remove inactive]",
+        ] {
+            assert!(screen.contains(text), "{text}: {screen}");
+        }
+        super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(ui.modal, Some(Modal::UpgradeActions { .. })));
+        assert!(render_ui(&mut ui).contains("Remove inactive"));
+        assert!(jobs.try_recv().is_err());
+        ui.modal = None;
+        sw.set_upgrade(crate::upgrade::Progress::Verified {
+            remote: "flash:cat9k_lite_iosxe.17.15.06.SPA.bin".into(),
+            md5: "78805a221a988e79ef3f42d7c5bfd418".into(),
+            version: Some("17.15.6".into()),
+        });
+        assert!(render_ui(&mut ui).contains("[u Upgrade]"));
+        // Mouse hit areas must overlay the rendered buttons, including their row.
+        for width in [110, 120, 160] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, 40)).unwrap();
+            terminal.draw(|f| draw(f, &mut ui)).unwrap();
+            let buffer = terminal.backend().buffer();
+            for button in &ui.upgrade_buttons {
+                let rendered: String = (button.area.x..button.area.right())
+                    .map(|x| buffer[(x, button.area.y)].symbol())
+                    .collect();
+                assert_eq!(
+                    rendered,
+                    if button.action == 2 {
+                        "[u Upgrade]"
+                    } else {
+                        "[i Remove inactive]"
+                    },
+                    "width {width}"
+                );
+            }
+        }
+        let button = ui.upgrade_buttons.iter().find(|b| b.action == 2).unwrap();
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: button.area.x,
+            row: button.area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        super::super::handle_mouse(&mut ui, click);
+        assert!(matches!(ui.modal, Some(Modal::ConfirmInstall { .. })));
+        assert!(jobs.try_recv().is_err());
+        ui.modal = None;
+
+        for (key, mods, yes) in [
+            (KeyCode::Char('y'), KeyModifiers::NONE, true),
+            (KeyCode::Char('Y'), KeyModifiers::NONE, false),
+            (KeyCode::Enter, KeyModifiers::NONE, false),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL, false),
+        ] {
+            super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Char('u')));
+            assert!(matches!(ui.modal, Some(Modal::ConfirmInstall { .. })));
+            assert!(render_ui(&mut ui).contains("ANY OTHER KEY: cancel"));
+            super::super::handle_key(&mut ui, KeyEvent::new(key, mods));
+            if yes {
+                assert!(matches!(
+                    jobs.try_recv().unwrap().untracked(),
+                    crate::switch::Job::Install { yolo: false }
+                ));
+                sw.complete_job_for_test();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while ui.app.engine().busy(sw.id) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            } else {
+                assert!(jobs.try_recv().is_err());
+            }
+            ui.modal = None;
+        }
+        sw.facts_for_test(|f| f.version.as_mut().unwrap().version = Some("17.15.06".into()));
+        super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Char('u')));
+        assert!(ui.modal.is_none());
+        assert!(ui
+            .status_msg
+            .as_ref()
+            .unwrap()
+            .contains("already installed"));
+    }
+
+    #[test]
+    fn upgrade_metrics_show_progress_speed_and_eta_for_the_assigned_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let ui = test_ui(app);
+        let sw = test_switch(SwitchState::Busy {
+            what: "copy".into(),
+        });
+        sw.begin_transfer(
+            "image.bin".into(),
+            10_000_000,
+            crate::session::Protocol::Http,
+        );
+        let h = ui.app.sessions.open(
+            crate::session::Protocol::Http,
+            "10.20.30.40:50000".parse().unwrap(),
+            8080,
+        );
+        ui.app.sessions.update(h.id, |s| {
+            s.file = Some("image.bin".into());
+            s.total = Some(10_000_000);
+            s.direction = Some(crate::session::Direction::Download);
+            s.state = SessionState::Transferring;
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        h.add_bytes(5_000_000);
+        ui.app.sessions.sample();
+        let (percent, speed, eta) = upgrade_metrics(&ui, &sw, Some("image.bin"));
+        assert_eq!(percent, "50%");
+        assert_ne!(speed, "—");
+        assert_ne!(eta, "—");
+        assert_eq!(upgrade_metrics(&ui, &sw, Some("other.bin")).0, "—");
+    }
+
+    #[test]
+    fn reload_requires_plain_y_and_timer_is_visible_in_console() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (code, modifiers, expected) in [
+            (KeyCode::Char('y'), KeyModifiers::NONE, true),
+            (KeyCode::Char('Y'), KeyModifiers::NONE, false),
+            (KeyCode::Char('y'), KeyModifiers::CONTROL, false),
+            (KeyCode::Enter, KeyModifiers::NONE, false),
+            (KeyCode::Esc, KeyModifiers::NONE, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (_rt, app) = test_app(dir.path().to_path_buf());
+            let mut ui = test_ui(app);
+            let (sw, mut reply) = crate::switch::Switch::for_test_reload();
+            ui.session_view = Some(super::super::SessionView {
+                switch: sw,
+                scroll: None,
+                jobs_seen: 0,
+            });
+            ui.modal = Some(Modal::Session);
+            let screen = render_ui(&mut ui);
+            assert!(screen.contains("10.20.30.40") && screen.contains("CONFIRM RELOAD"));
+            super::super::handle_key(&mut ui, KeyEvent::new(code, modifiers));
+            assert_eq!(reply.try_recv().unwrap(), expected);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        let sw = test_switch(crate::switch::SwitchState::Rebooting);
+        sw.set_upgrade(crate::upgrade::Progress::Rebooting {
+            since: std::time::Instant::now() - std::time::Duration::from_secs(345),
+            attempts: 2,
+            last_error: None,
+        });
+        ui.session_view = Some(super::super::SessionView {
+            switch: sw,
+            scroll: None,
+            jobs_seen: 0,
+        });
+        ui.modal = Some(Modal::Session);
+        assert!(render_ui(&mut ui).contains("rebooting 05:45"));
+    }
+
+    #[test]
+    fn transfer_shows_ten_devices_and_scrolls_to_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        for n in 1..=12 {
+            let sw = ui.app.switches.connect(crate::switch::Target {
+                host: format!("127.0.0.{n}"),
+                port: 1,
+                username: "test".into(),
+                password: "secret".into(),
+                enable_password: String::new(),
+                known_hosts: dir.path().join("known_hosts"),
+                auto_trust: true,
+            });
+            sw.facts_for_test(|facts| facts.hostname = Some(format!("device-{n:02}")));
+        }
+        ui.tab = Tab::Files;
+        let first = render_ui(&mut ui);
+        for n in 1..=10 {
+            assert!(first.contains(&format!("device-{n:02}")));
+        }
+        assert!(!first.contains("device-11"));
+        assert!(first.contains("1–10 / 12") && first.contains("↓ more"));
+        ui.switch_sel = 11;
+        let last = render_ui(&mut ui);
+        assert!(last.contains("device-12"));
+        assert!(last.contains("3–12 / 12") && last.contains("↑ more"));
+        for sw in ui.app.switches.list() {
+            sw.cancel();
+        }
+    }
+
+    #[test]
+    fn ios_files_are_colored_and_reboot_thresholds_are_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "cat9k_lite-rpbase.17.15.03.SPA.pkg",
+            "cat9k_lite_iosxe.17.09.04a.SPA.bin",
+            "cat9k_lite_iosxe.17.15.03.SPA.conf",
+            "packages.conf",
+            "notes.txt",
+        ] {
+            std::fs::write(dir.path().join(name), "test").unwrap();
+        }
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        ui.tab = Tab::Files;
+        ui.transfer_ui.focus = 0;
+        ui.files.refresh(dir.path());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut ui)).unwrap();
+        let buf = terminal.backend().buffer();
+        for (name, color) in [
+            ("cat9k_lite-rpbase", theme::WARN),
+            ("cat9k_lite_iosxe.17.09", theme::WARN),
+            ("cat9k_lite_iosxe.17.15", theme::WARN),
+            ("packages.conf", theme::WARN),
+            ("notes.txt", theme::TEXT),
+        ] {
+            let (x, y) = (0..40)
+                .find_map(|y| {
+                    let line: String = (0..120).map(|x| buf[(x, y)].symbol()).collect();
+                    line.find(name)
+                        .map(|byte| (line[..byte].chars().count() as u16, y))
+                })
+                .unwrap();
+            assert_eq!(buf[(x, y)].fg, color, "{name}");
+        }
+        for (seconds, color) in [
+            (0, theme::OK),
+            (299, theme::OK),
+            (300, theme::WARN),
+            (599, theme::WARN),
+            (600, theme::ERR),
+        ] {
+            let progress = crate::upgrade::Progress::Rebooting {
+                since: std::time::Instant::now() - std::time::Duration::from_secs(seconds),
+                attempts: 0,
+                last_error: None,
+            };
+            assert_eq!(reboot_color(&progress), color);
+        }
+    }
+
+    #[test]
+    fn protocol_selection_is_per_device_and_connections_have_no_picker() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        {
+            let mut cfg = ui.app.config.write().unwrap();
+            for id in ServiceId::ALL {
+                cfg.service_mut(id).enabled = false;
+            }
+            cfg.ftp.enabled = true;
+        }
+        let sw = ui.app.switches.connect(crate::switch::Target {
+            host: "127.0.0.1".into(),
+            port: 1,
+            username: "test".into(),
+            password: "secret".into(),
+            enable_password: String::new(),
+            known_hosts: dir.path().join("known_hosts"),
+            auto_trust: true,
+        });
+        ui.tab = Tab::Files;
+        super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Char('a')));
+        assert!(ui.modal.is_none());
+        super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Char('p')));
+        assert!(
+            matches!(&ui.modal,Some(Modal::TransferProtocol{options,selected,..}) if options[*selected]==crate::session::Protocol::Ftp)
+        );
+        super::super::handle_modal_key(&mut ui, KeyEvent::from(KeyCode::Enter));
+        assert!(sw.protocol_chosen());
+        assert_eq!(sw.protocol(), crate::session::Protocol::Ftp);
+        super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Char('p')));
+        assert!(
+            matches!(&ui.modal,Some(Modal::TransferProtocol{options,selected,..}) if options[*selected]==sw.protocol())
+        );
+        sw.cancel();
+    }
+
+    #[test]
+    fn changing_an_idle_job_image_invalidates_its_verified_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        let sw = test_switch(crate::switch::SwitchState::Ready);
+        let mut other = test_switch(crate::switch::SwitchState::Ready);
+        std::sync::Arc::get_mut(&mut other).unwrap().id = 2;
+        for name in ["one.bin", "two.bin", "three.bin"] {
+            std::fs::write(dir.path().join(name), b"test image").unwrap();
+        }
+        ui.app.switches.add_for_test(sw.clone());
+        ui.app.switches.add_for_test(other.clone());
+        super::super::assign_upgrade(&mut ui, &sw, ("one.bin".into(), 10));
+        super::super::assign_upgrade(&mut ui, &other, ("two.bin".into(), 20));
+        sw.set_upgrade(crate::upgrade::Progress::Verified {
+            remote: "flash:one.bin".into(),
+            md5: "x".into(),
+            version: Some("17.15.3".into()),
+        });
+        super::super::assign_upgrade(&mut ui, &sw, ("one.bin".into(), 10));
+        assert!(matches!(
+            sw.upgrade(),
+            crate::upgrade::Progress::Verified { .. }
+        ));
+        super::super::assign_upgrade(&mut ui, &sw, ("three.bin".into(), 30));
+        assert!(matches!(sw.upgrade(), crate::upgrade::Progress::Idle));
+        assert_eq!(ui.upgrade_assignments[&other.id].0, "two.bin");
+    }
+
+    #[test]
+    fn connect_tab_opens_ssh_without_selecting_a_transfer_protocol() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        ui.tab = Tab::Connect;
+        super::super::handle_key(&mut ui, KeyEvent::from(KeyCode::Char('a')));
+        let form = &mut ui.deploy.as_mut().unwrap().form;
+        assert!(!super::super::DeployField::ADD.contains(&super::super::DeployField::Protocol));
+        form.host = "127.0.0.1".into();
+        form.port = "1".into();
+        form.username = "test".into();
+        form.password = "secret".into();
+        super::super::add_devices(&mut ui);
+        assert_eq!(ui.tab, Tab::Connect);
+        assert!(matches!(ui.modal, Some(Modal::Session)));
+        assert!(ui
+            .session_view
+            .as_ref()
+            .unwrap()
+            .switch
+            .transfer(&ui.app.sessions)
+            .is_none());
+        assert!(ui.deploy.as_ref().unwrap().form.password.is_empty());
+        ui.session_view.as_ref().unwrap().switch.cancel();
+    }
+
+    #[test]
+    fn transfer_navigation_returns_to_root_and_hides_symlink_escapes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("one/two")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        ui.tab = Tab::Files;
+        ui.files.refresh(dir.path());
+        assert!(!ui.files.entries.iter().any(|e| e.name == "escape"));
+        let press = |ui: &mut Ui, code| {
+            super::super::handle_key(ui, KeyEvent::new(code, KeyModifiers::NONE))
+        };
+        press(&mut ui, KeyCode::Enter);
+        assert_eq!(ui.files.cwd, "one");
+        ui.files.filter = "two".into();
+        ui.files.selected = 1;
+        press(&mut ui, KeyCode::Enter);
+        assert_eq!(ui.files.cwd, "one/two");
+        ui.files.filter = "no matches".into();
+        assert_eq!(ui.files.visible()[0].name, "..");
+        press(&mut ui, KeyCode::Backspace);
+        assert_eq!(ui.files.cwd, "one");
+        assert!(ui.files.filter.is_empty());
+        press(&mut ui, KeyCode::Enter);
+        assert!(ui.files.cwd.is_empty());
+        press(&mut ui, KeyCode::Backspace);
+        assert!(ui.files.cwd.is_empty());
+        press(&mut ui, KeyCode::Enter);
+        press(&mut ui, KeyCode::Home);
+        assert!(ui.files.cwd.is_empty());
+        let screen = render_ui(&mut ui);
+        for label in ["3 Transfer", "DEVICES", "LOCAL", "REMOTE", "LOCAL → REMOTE"] {
+            assert!(screen.contains(label), "{label}");
+        }
+        press(&mut ui, KeyCode::Right);
+        assert_eq!(ui.transfer_ui.focus, 2);
+        assert!(render_ui(&mut ui).contains("REMOTE → LOCAL"));
+        press(&mut ui, KeyCode::Char('d'));
+        assert!(
+            ui.modal.is_none(),
+            "remote-pane keys must not act on local files"
+        );
+        press(&mut ui, KeyCode::Tab);
+        assert_eq!(ui.transfer_ui.focus, 0);
+        press(&mut ui, KeyCode::Tab);
+        assert_eq!(ui.transfer_ui.focus, 1);
+    }
+
+    #[test]
     fn every_view_and_modal_renders() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("image.bin"), b"x").unwrap();
@@ -2534,31 +3666,11 @@ mod tests {
             );
         }
 
-        // The dashboard gives the log pane its own full-width block.
         ui.tab = Tab::Dashboard;
         let dash = render_ui(&mut ui);
-        assert!(dash.contains("LOGS (5)"), "dashboard has no log block");
-        let log_row = dash
-            .lines()
-            .find(|l| l.contains("LOGS (5)"))
-            .expect("log block");
-        // Full width means the block's border reaches the right edge.
-        assert!(
-            log_row.trim_end().chars().count() >= 118,
-            "log block is not full width"
-        );
-        // Credentials are the fixed defaults.
-        assert!(dash.contains("cisco / cisco123"), "unexpected credentials");
-        // The address generated URLs use is named, with where it came from,
-        // and the interface it belongs to is marked in the list.
-        assert!(dash.contains("address in URLs"), "no advertised address");
-        if let (Some(ip), _) = super::super::advertised_now(&ui.app.config.read().unwrap()) {
-            assert!(dash.contains(&ip.to_string()), "address not shown");
-            let marked = dash
-                .lines()
-                .find(|l| l.contains('→') && l.contains(&ip.to_string()));
-            assert!(marked.is_some(), "advertised interface not marked");
-        }
+        assert!(dash.contains("SERVICES"));
+        assert!(dash.contains("cisco / cisco123"));
+        assert!(dash.contains("address in URLs"));
 
         for modal in [
             Modal::Help,
@@ -2716,39 +3828,38 @@ mod tests {
                 .join("\n"),
         );
         let screen = render_ui(&mut ui);
-        for field in ["username", "password", "enable password", "protocol"] {
+        for field in [
+            "username",
+            "password",
+            "enable password",
+            "device IP / Subnet:",
+        ] {
             assert!(screen.contains(field), "long IP list hides {field}");
         }
         assert_eq!(ui.deploy.as_ref().unwrap().form.host.lines().count(), 199);
     }
 
     #[test]
-    fn bulk_scan_toggle_exposes_cidr_validation_before_starting_any_connection() {
+    fn bulk_accepts_ips_and_subnets_and_validates_before_connecting() {
         let dir = tempfile::tempdir().unwrap();
         let (_rt, app) = test_app(dir.path().to_path_buf());
         let mut ui = test_ui(app);
         super::super::activate_upgrade_action(&mut ui, 2);
         let form = &mut ui.deploy.as_mut().unwrap().form;
-        form.field = 5;
-        form.username = "netadmin".into();
+        form.host = "192.168.22.0/24, 192.168.11.11, invalid".into();
+        form.username = "test".into();
         form.password = "secret".into();
-        form.host = "192.168.10.0/99".into();
-        super::super::handle_modal_key(
-            &mut ui,
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char(' '),
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        );
-        assert!(ui.deploy.as_ref().unwrap().form.scan_subnet);
         let screen = render_ui(&mut ui);
-        assert!(screen.contains("IPv4 subnet / CIDR"));
-        assert!(screen.contains("Scan subnet"));
-        assert!(screen.contains("changed SSH host keys"));
+        assert!(screen.contains("device IP / Subnet:"));
+        assert!(!screen.contains("scan subnet (exp.)"));
         super::super::add_devices(&mut ui);
-        assert!(ui.deploy.as_ref().unwrap().error.is_some());
-        assert!(ui.app.switches.scan().is_none());
         assert!(ui.app.switches.list().is_empty());
+        assert!(ui.app.switches.scan().is_none());
+        assert!(ui.deploy.as_ref().unwrap().error.is_some());
+        let targets =
+            super::super::bulk_targets("192.168.22.0/24, 192.168.11.11, 192.168.22.0/24").unwrap();
+        assert_eq!(targets.subnets, ["192.168.22.0/24"]);
+        assert_eq!(targets.direct, ["192.168.11.11"]);
     }
 
     #[test]
@@ -2801,11 +3912,11 @@ mod tests {
     }
 
     #[test]
-    fn overview_shows_device_facts_and_recalculates_file_capacity() {
+    fn connect_shows_mode_version_and_storage() {
         let dir = tempfile::tempdir().unwrap();
         let (_rt, app) = test_app(dir.path().to_path_buf());
         let mut ui = test_ui(app);
-        ui.tab = Tab::Upgrade;
+        ui.tab = Tab::Connect;
         let sw = ui.app.switches.connect(crate::switch::Target {
             host: "127.0.0.1".into(),
             port: 1,
@@ -2828,20 +3939,14 @@ mod tests {
         for label in [
             "model",
             "version",
-            "stack",
-            "flash usage",
+            "mode",
             "C9200L-48P-4X",
             "17.15.03",
-            "1305 MB free of 1957 MB",
-            "33% used",
-            "NO SPACE",
+            "1305 MB",
+            "1957 MB",
         ] {
             assert!(screen.contains(label), "missing {label}: {screen}");
         }
-        ui.upgrade_file = Some(("image.bin".into(), 1_304_999_999));
-        let screen = render_ui(&mut ui);
-        assert!(!screen.contains("NO SPACE"));
-        assert!(screen.contains("yes"));
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut ui)).unwrap();
         sw.cancel();
@@ -2871,22 +3976,13 @@ mod tests {
                     "Enter submitted a text field"
                 );
             }
-            if action == 2 {
-                super::super::handle_modal_key(&mut ui, enter);
-                assert!(!ui.deploy.as_ref().unwrap().form.scan_subnet);
-            }
-            super::super::handle_modal_key(&mut ui, enter);
-            assert!(matches!(ui.modal, Some(Modal::DeployProtocol { .. })));
-            super::super::handle_modal_key(&mut ui, enter);
-            assert_eq!(
-                ui.deploy.as_ref().unwrap().form.field,
-                if action == 2 { 7 } else { 6 }
-            );
+            assert_eq!(ui.deploy.as_ref().unwrap().form.field, 5);
             assert!(render_ui(&mut ui).contains("[ Enter ]"));
             assert!(ui.app.switches.list().is_empty());
             super::super::handle_modal_key(&mut ui, enter);
             assert_eq!(ui.app.switches.list().len(), 1);
-            assert!(ui.modal.is_none());
+            assert_eq!(ui.tab, Tab::Connect);
+            assert_eq!(ui.modal.is_some(), action == 1);
             let switch = ui.app.switches.list()[0].clone();
             assert!(switch.transfer(&ui.app.sessions).is_none());
             switch.cancel();
@@ -2894,7 +3990,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_selected_file_is_above_devices_on_the_right() {
+    fn upgrade_file_browser_is_above_device_jobs() {
         let dir = tempfile::tempdir().unwrap();
         let (_rt, app) = test_app(dir.path().to_path_buf());
         let mut ui = test_ui(app);
@@ -2908,12 +4004,14 @@ mod tests {
             .unwrap();
         let device_row = rows
             .iter()
-            .position(|row| row.contains(" DEVICES "))
+            .position(|row| row.contains(" DEVICE JOBS"))
             .unwrap();
         assert!(file_row < device_row);
-        let column = rows[file_row].find("images/selected-image.bin").unwrap();
-        assert!(rows[file_row][..column].chars().count() >= 23);
-        assert!(rows[file_row + 1].contains("50.0 MB"));
+        let browser_row = rows
+            .iter()
+            .position(|row| row.contains("FILE BROWSER"))
+            .unwrap();
+        assert!(browser_row < device_row);
     }
 
     #[test]
@@ -3003,7 +4101,7 @@ mod tests {
         let devices = ui.app.switches.list();
         assert_eq!(devices.len(), 2);
         for device in devices {
-            assert_eq!(device.protocol(), crate::session::Protocol::Sftp);
+            assert!(!device.protocol_chosen());
             assert!(device.transfer(&ui.app.sessions).is_none());
             device.cancel();
         }
@@ -3025,6 +4123,8 @@ mod tests {
         );
         super::super::handle_modal_key(&mut ui, key);
         assert_eq!(ui.files.cwd, "images");
+        assert_eq!(ui.files.visible()[0].name, "..");
+        ui.files.selected = 1;
         super::super::handle_modal_key(&mut ui, key);
         assert_eq!(ui.upgrade_file, Some(("images/image.bin".into(), 5)));
         assert!(ui.modal.is_none());
@@ -3060,10 +4160,12 @@ mod tests {
         ui.tab = Tab::Files;
         ui.modal = Some(Modal::Deploy);
 
-        let mut form = super::super::DeployForm::default();
-        form.host = "10.20.30.40".into();
-        form.username = "netadmin".into();
-        form.password = "letmein".into();
+        let form = super::super::DeployForm {
+            host: "10.20.30.40".into(),
+            username: "netadmin".into(),
+            password: "letmein".into(),
+            ..Default::default()
+        };
         ui.deploy = Some(super::super::DeployView {
             rel_path: "image.bin".into(),
             size: 504_057_659,
@@ -3077,7 +4179,7 @@ mod tests {
         }
         assert!(screen.contains("copy http://"), "no command preview");
         assert!(screen.contains("never a config"), "missing the safety note");
-        assert!(!screen.contains("letmein"), "password shown in clear");
+        assert!(!screen.contains("letmein"), "SSH password must be masked");
     }
 
     #[test]
@@ -3162,12 +4264,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_rt, app) = test_app(dir.path().to_path_buf());
         let mut ui = test_ui(app);
-        ui.tab = Tab::Upgrade;
+        ui.tab = Tab::Connect;
 
         // Empty: the view explains how to get a session.
         let screen = render_ui(&mut ui);
-        assert!(screen.contains("DEVICES"), "no table");
-        assert!(screen.contains("Add device"), "no hint for the empty view");
+        assert!(screen.contains("CONNECTIONS"), "no table");
+        assert!(screen.contains("a: add"), "no hint for the empty view");
 
         // A half-upgraded stack must stand out in the detail pane.
         let switch = test_switch(crate::switch::SwitchState::Ready);
@@ -3221,7 +4323,10 @@ mod tests {
         let screen = render_help(120, 40, 0).join("\n");
         for (_, rows) in HELP_LEFT.iter().chain(HELP_RIGHT.iter()) {
             for (key, desc) in rows.iter() {
-                assert!(screen.contains(desc), "missing help entry {key} — {desc}");
+                assert!(
+                    screen.contains(desc),
+                    "missing help entry {key} — {desc}:\n{screen}"
+                );
             }
         }
         // Closed box: the double border must be complete top and bottom.
@@ -3240,9 +4345,9 @@ mod tests {
                 .find_map(|l| l.find(needle).map(|b| l[..b].chars().count()))
         };
         let left_a = col_of("select service").unwrap();
-        let left_b = col_of("cycle sort order").unwrap();
+        let left_b = col_of("sort / refresh listing").unwrap();
         assert_eq!(left_a, left_b, "left table not aligned");
-        let right_a = col_of("dashboard").unwrap();
+        let right_a = col_of("select tab").unwrap();
         let right_b = col_of("protocol filter").unwrap();
         assert_eq!(right_a, right_b, "right table not aligned");
     }
@@ -3269,5 +4374,44 @@ mod tests {
                 assert!(key.chars().count() <= 6, "key too wide: {key}");
             }
         }
+    }
+    #[test]
+    fn workflow_keyboard_paste_edits_fields_but_cannot_approve_actions() {
+        use super::super::workflow::{self, Field};
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        workflow::open(&mut ui);
+        ui.workflow.edit = Some(Field::Source);
+        super::super::handle_paste(&mut ui, "abc.txt".into());
+        assert_eq!(ui.workflow.source, "abc.txt");
+        ui.workflow.edit = None;
+        super::super::handle_paste(&mut ui, "y".into());
+        assert_eq!(ui.workflow.source, "abc.txt");
+        let text = render_ui(&mut ui);
+        assert!(text.contains("WORKFLOW ASSISTANT"));
+    }
+    #[test]
+    fn workflow_login_masks_password_and_supports_paste_and_clear() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir().unwrap();
+        let (_rt, app) = test_app(dir.path().to_path_buf());
+        let mut ui = test_ui(app);
+        let form = super::super::DeployForm {
+            field: 1,
+            ..Default::default()
+        };
+        ui.modal = Some(super::super::Modal::WorkflowLogin { device: 1, form });
+        super::super::handle_paste(&mut ui, "ssh-secret".into());
+        let text = render_ui(&mut ui);
+        assert!(!text.contains("ssh-secret"));
+        assert!(text.contains("••"));
+        super::super::handle_key(
+            &mut ui,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert!(
+            matches!(ui.modal,Some(super::super::Modal::WorkflowLogin { ref form, .. }) if form.password.is_empty())
+        );
     }
 }

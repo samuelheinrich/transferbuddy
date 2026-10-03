@@ -1,17 +1,22 @@
 mod intro;
 mod theme;
 mod views;
+mod workflow;
+
+#[cfg(test)]
+mod screenshots;
 
 use std::io::Write as _;
 use std::path::PathBuf;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event as CEvent, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -22,154 +27,83 @@ use crate::logging::{Event, LogLevel};
 use crate::services::ServiceId;
 use crate::session::Protocol;
 use crate::sound::Tone;
-use crate::switch::{Job, Switch, SwitchState, Target};
+use crate::switch::{Switch, SwitchState, Target};
 use crate::SharedApp;
+use transferbuddy_core::engine::{Command, Credentials, Setting};
 
+#[cfg(test)]
+pub const SUPPORTED_ACTIONS: &[transferbuddy_core::engine::Action] = &[
+    transferbuddy_core::engine::Action::Workflow,
+    transferbuddy_core::engine::Action::Profiles,
+    transferbuddy_core::engine::Action::Report,
+    transferbuddy_core::engine::Action::Review,
+    transferbuddy_core::engine::Action::Services,
+    transferbuddy_core::engine::Action::Settings,
+    transferbuddy_core::engine::Action::Root,
+    transferbuddy_core::engine::Action::Connect,
+    transferbuddy_core::engine::Action::BulkConnect,
+    transferbuddy_core::engine::Action::CancelScan,
+    transferbuddy_core::engine::Action::Reconnect,
+    transferbuddy_core::engine::Action::Disconnect,
+    transferbuddy_core::engine::Action::RemoveDevice,
+    transferbuddy_core::engine::Action::ClearFinished,
+    transferbuddy_core::engine::Action::Refresh,
+    transferbuddy_core::engine::Action::Cli,
+    transferbuddy_core::engine::Action::ListLocal,
+    transferbuddy_core::engine::Action::ListRemote,
+    transferbuddy_core::engine::Action::Hash,
+    transferbuddy_core::engine::Action::CopyCommands,
+    transferbuddy_core::engine::Action::Protocol,
+    transferbuddy_core::engine::Action::Send,
+    transferbuddy_core::engine::Action::Receive,
+    transferbuddy_core::engine::Action::Queue,
+    transferbuddy_core::engine::Action::Retry,
+    transferbuddy_core::engine::Action::Resume,
+    transferbuddy_core::engine::Action::Cancel,
+    transferbuddy_core::engine::Action::Delete,
+    transferbuddy_core::engine::Action::AssignImage,
+    transferbuddy_core::engine::Action::Deploy,
+    transferbuddy_core::engine::Action::Verify,
+    transferbuddy_core::engine::Action::Install,
+    transferbuddy_core::engine::Action::Yolo,
+    transferbuddy_core::engine::Action::RemoveInactive,
+    transferbuddy_core::engine::Action::Confirmation,
+    transferbuddy_core::engine::Action::Logs,
+    transferbuddy_core::engine::Action::Shutdown,
+];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Dashboard,
-    Services,
+    Connect,
     Files,
-    Sessions,
     Logs,
     Upgrade,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 5] = [
         Tab::Dashboard,
-        Tab::Services,
+        Tab::Connect,
         Tab::Files,
-        Tab::Sessions,
-        Tab::Logs,
         Tab::Upgrade,
+        Tab::Logs,
     ];
     pub fn title(self) -> &'static str {
         match self {
-            Tab::Dashboard => "1 Dashboard",
-            Tab::Services => "2 Services",
-            Tab::Files => "3 Files",
-            Tab::Sessions => "4 Sessions",
-            Tab::Logs => "5 Logs",
-            Tab::Upgrade => "6 Upgrade",
+            Tab::Dashboard => transferbuddy_core::workspace::WorkspaceView::Dashboard.title(),
+            Tab::Connect => transferbuddy_core::workspace::WorkspaceView::Connect.title(),
+            Tab::Files => transferbuddy_core::workspace::WorkspaceView::Transfer.title(),
+            Tab::Logs => transferbuddy_core::workspace::WorkspaceView::Logs.title(),
+            Tab::Upgrade => transferbuddy_core::workspace::WorkspaceView::Upgrade.title(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortBy {
-    Name,
-    Size,
-    Modified,
-}
-
-impl SortBy {
-    pub fn label(self) -> &'static str {
-        match self {
-            SortBy::Name => "name",
-            SortBy::Size => "size",
-            SortBy::Modified => "modified",
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct FileEntry {
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub modified: Option<SystemTime>,
-    pub ext: String,
-}
-
-pub struct FileBrowser {
-    /// Path relative to root, "" = root.
-    pub cwd: String,
-    pub entries: Vec<FileEntry>,
-    pub selected: usize,
-    pub sort: SortBy,
-    pub filter: String,
-    pub error: Option<String>,
-}
-
-impl FileBrowser {
-    fn new() -> Self {
-        Self {
-            cwd: String::new(),
-            entries: Vec::new(),
-            selected: 0,
-            sort: SortBy::Name,
-            filter: String::new(),
-            error: None,
-        }
-    }
-
-    pub fn visible(&self) -> Vec<&FileEntry> {
-        let f = self.filter.to_lowercase();
-        self.entries
-            .iter()
-            .filter(|e| f.is_empty() || e.name.to_lowercase().contains(&f))
-            .collect()
-    }
-
-    fn refresh(&mut self, root: &PathBuf) {
-        self.error = None;
-        let dir = if self.cwd.is_empty() {
-            root.clone()
-        } else {
-            root.join(&self.cwd)
-        };
-        let mut entries = Vec::new();
-        match std::fs::read_dir(&dir) {
-            Ok(rd) => {
-                for e in rd.flatten() {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if name.starts_with('.') {
-                        continue;
-                    }
-                    let meta = match e.metadata() {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    let ext = std::path::Path::new(&name)
-                        .extension()
-                        .map(|x| x.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    entries.push(FileEntry {
-                        is_dir: meta.is_dir(),
-                        size: meta.len(),
-                        modified: meta.modified().ok(),
-                        name,
-                        ext,
-                    });
-                }
-            }
-            Err(e) => self.error = Some(format!("cannot read directory: {e}")),
-        }
-        match self.sort {
-            SortBy::Name => entries.sort_by(|a, b| {
-                b.is_dir
-                    .cmp(&a.is_dir)
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            }),
-            SortBy::Size => {
-                entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| b.size.cmp(&a.size)))
-            }
-            SortBy::Modified => entries.sort_by(|a, b| {
-                b.is_dir
-                    .cmp(&a.is_dir)
-                    .then_with(|| b.modified.cmp(&a.modified))
-            }),
-        }
-        self.entries = entries;
-        if self.selected >= self.visible().len() {
-            self.selected = self.visible().len().saturating_sub(1);
-        }
-    }
-}
+pub use transferbuddy_core::files::{FileBrowser, FileEntry, SortBy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputAction {
+    Root,
     Port(ServiceId),
     Bind(ServiceId),
     Username,
@@ -256,7 +190,6 @@ pub enum DeployField {
     Protocol,
     Destination,
     Overwrite,
-    ScanSubnet,
     Submit,
 }
 
@@ -271,25 +204,15 @@ impl DeployField {
         DeployField::Destination,
         DeployField::Overwrite,
     ];
-    pub const ADD: [DeployField; 7] = [
+    pub const ADD: [DeployField; 6] = [
         DeployField::Host,
         DeployField::Port,
         DeployField::Username,
         DeployField::Password,
         DeployField::EnablePassword,
-        DeployField::Protocol,
         DeployField::Submit,
     ];
-    pub const BULK: [DeployField; 8] = [
-        DeployField::Host,
-        DeployField::Port,
-        DeployField::Username,
-        DeployField::Password,
-        DeployField::EnablePassword,
-        DeployField::ScanSubnet,
-        DeployField::Protocol,
-        DeployField::Submit,
-    ];
+    pub const BULK: [DeployField; 6] = Self::ADD;
     pub fn label(self) -> &'static str {
         match self {
             DeployField::Host => "switch IP / host",
@@ -300,7 +223,6 @@ impl DeployField {
             DeployField::Protocol => "protocol",
             DeployField::Destination => "destination",
             DeployField::Overwrite => "overwrite",
-            DeployField::ScanSubnet => "scan subnet (exp.)",
             DeployField::Submit => "",
         }
     }
@@ -308,10 +230,7 @@ impl DeployField {
     pub fn is_text(self) -> bool {
         !matches!(
             self,
-            DeployField::Protocol
-                | DeployField::Overwrite
-                | DeployField::ScanSubnet
-                | DeployField::Submit
+            DeployField::Protocol | DeployField::Overwrite | DeployField::Submit
         )
     }
 }
@@ -329,7 +248,6 @@ pub struct DeployForm {
     pub proto: Protocol,
     pub dest: String,
     pub overwrite: bool,
-    pub scan_subnet: bool,
     pub field: usize,
 }
 
@@ -344,7 +262,6 @@ impl Default for DeployForm {
             proto: Protocol::Http,
             dest: "flash:".into(),
             overwrite: false,
-            scan_subnet: false,
             field: 0,
         }
     }
@@ -379,6 +296,15 @@ pub struct SessionView {
 }
 
 pub enum Modal {
+    Workflow,
+    WorkflowLogin {
+        device: u64,
+        form: DeployForm,
+    },
+    CoreQuestion(transferbuddy_core::engine::Confirmation),
+    Jobs {
+        selected: usize,
+    },
     Help,
     ConfirmQuit,
     ConfirmUploads,
@@ -416,13 +342,63 @@ pub enum Modal {
     /// Live transcript of one switch session; the data lives in
     /// `Ui::session_view`.
     Session,
+    Cli,
+    TransferProtocol {
+        options: Vec<Protocol>,
+        selected: usize,
+        start: bool,
+        upgrade: bool,
+    },
+    ConfirmDelete {
+        request: u64,
+        switch: Arc<Switch>,
+        path: String,
+        recursive: bool,
+    },
+    UpgradeActions {
+        switch: Arc<Switch>,
+        selected: usize,
+    },
+    ConfirmInstall {
+        request: u64,
+        switch: Arc<Switch>,
+        yolo: bool,
+    },
+}
+
+pub struct TransferUi {
+    /// 0 = device overview, 1 = local, 2 = remote.
+    pub focus: usize,
+    pub remote_cwd: String,
+    pub remote_selected: usize,
+    pub device: Option<u64>,
+    pub requested: Option<String>,
+}
+impl Default for TransferUi {
+    fn default() -> Self {
+        Self {
+            focus: 1,
+            remote_cwd: String::new(),
+            remote_selected: 0,
+            device: None,
+            requested: None,
+        }
+    }
+}
+pub struct UpgradeButton {
+    pub area: Rect,
+    pub switch: Arc<Switch>,
+    pub action: usize,
 }
 
 pub struct Ui {
     pub app: SharedApp,
+    pub workflow: workflow::Editor,
     pub tab: Tab,
     pub service_sel: usize,
+    pub dashboard_transfers: bool,
     pub files: FileBrowser,
+    pub transfer_ui: TransferUi,
     pub session_sel: usize,
     pub log_scroll: usize,
     pub log_follow: bool,
@@ -434,6 +410,7 @@ pub struct Ui {
     pub status_msg: Option<String>,
     /// Last computed file hashes, shown by the Hashes modal.
     pub hashes: Option<HashInfo>,
+    pub hash_request: Option<String>,
     /// Scroll offset of the help modal (it is taller than short terminals).
     pub help_scroll: usize,
     /// Deploy form, kept across modal opens so host and user do not have to
@@ -445,6 +422,9 @@ pub struct Ui {
     pub switch_sel: usize,
     pub upgrade_menu: Option<usize>,
     pub upgrade_file: Option<(String, u64)>,
+    pub upgrade_assignments: std::collections::HashMap<u64, (String, u64)>,
+    pub upgrade_protocol: Protocol,
+    pub upgrade_buttons: Vec<UpgradeButton>,
     pub deploy_mode: DeployMode,
     pub pending_deploy: Option<(ServiceId, Instant)>,
 }
@@ -467,7 +447,8 @@ fn install_panic_hook() {
         let _ = crossterm::execute!(
             std::io::stdout(),
             LeaveAlternateScreen,
-            DisableBracketedPaste
+            DisableBracketedPaste,
+            DisableMouseCapture
         );
         previous(info);
     }));
@@ -477,7 +458,12 @@ pub fn run(app: SharedApp) -> Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    crossterm::execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -495,7 +481,8 @@ pub fn run(app: SharedApp) -> Result<()> {
     crossterm::execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        DisableMouseCapture
     )?;
     terminal.show_cursor()?;
     result
@@ -507,9 +494,12 @@ fn run_loop(
 ) -> Result<()> {
     let mut ui = Ui {
         app,
+        workflow: workflow::Editor::default(),
         tab: Tab::Dashboard,
         service_sel: 0,
+        dashboard_transfers: false,
         files: FileBrowser::new(),
+        transfer_ui: TransferUi::default(),
         session_sel: 0,
         log_scroll: 0,
         log_follow: true,
@@ -520,12 +510,16 @@ fn run_loop(
         should_quit: false,
         status_msg: None,
         hashes: None,
+        hash_request: None,
         help_scroll: 0,
         deploy: None,
         session_view: None,
         switch_sel: 0,
         upgrade_menu: Some(0),
         upgrade_file: None,
+        upgrade_assignments: std::collections::HashMap::new(),
+        upgrade_protocol: Protocol::Http,
+        upgrade_buttons: Vec::new(),
         deploy_mode: DeployMode::Copy,
         pending_deploy: None,
     };
@@ -534,14 +528,42 @@ fn run_loop(
 
     loop {
         pump_pending_deploy(&mut ui);
+        pump_transfer(&mut ui);
+        pump_upgrades(&mut ui);
         for switch in ui.app.switches.list() {
             switch.transfer(&ui.app.sessions);
         }
         pump_session(&mut ui);
+        if matches!(ui.modal, Some(Modal::Hashes)) && ui.hashes.is_none() {
+            if let Some((path, result)) = ui.hash_request.clone().and_then(|path| {
+                ui.app
+                    .engine()
+                    .snapshot()
+                    .hashes
+                    .remove(&path)
+                    .map(|result| (path, result))
+            }) {
+                match result {
+                    Ok(h) => {
+                        ui.hashes = Some(HashInfo {
+                            rel_path: path,
+                            md5: h.md5,
+                            sha256: h.sha256,
+                            sha512: h.sha512,
+                            compare: None,
+                        });
+                        ui.status_msg = None;
+                    }
+                    Err(e) => ui.modal = Some(Modal::Message(e)),
+                }
+            }
+        }
+        workflow::tick(&mut ui);
         terminal.draw(|f| views::draw(f, &mut ui))?;
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 CEvent::Paste(text) => handle_paste(&mut ui, text),
+                CEvent::Mouse(event) => handle_mouse(&mut ui, event),
                 CEvent::Key(key) if key.kind == KeyEventKind::Press => handle_key(&mut ui, key),
                 _ => {}
             }
@@ -553,14 +575,26 @@ fn run_loop(
 }
 
 fn handle_key(ui: &mut Ui, key: KeyEvent) {
-    // Confirmation owns every key, including Ctrl-C and global shortcuts.
+    if matches!(ui.modal, Some(Modal::Cli)) {
+        handle_cli_key(ui, key);
+        return;
+    }
     if matches!(ui.modal, Some(Modal::Session))
-        && ui
-            .session_view
-            .as_ref()
-            .is_some_and(|v| matches!(v.switch.state(), SwitchState::CleanupConfirm { .. }))
+        && ui.session_view.as_ref().is_some_and(|v| {
+            matches!(
+                v.switch.state(),
+                SwitchState::CleanupConfirm { .. } | SwitchState::ReloadConfirm { .. }
+            )
+        })
     {
         handle_session_key(ui, key);
+        return;
+    }
+    if matches!(
+        ui.modal,
+        Some(Modal::ConfirmDelete { .. } | Modal::ConfirmInstall { .. })
+    ) {
+        handle_modal_key(ui, key);
         return;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -571,28 +605,25 @@ fn handle_key(ui: &mut Ui, key: KeyEvent) {
         handle_modal_key(ui, key);
         return;
     }
-    if ui.tab == Tab::Upgrade
-        && matches!(
-            key.code,
-            KeyCode::Tab
-                | KeyCode::BackTab
-                | KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Char('a')
-                | KeyCode::Char('f')
-                | KeyCode::Char('i')
-        )
-    {
-        handle_switches_key(ui, key);
+    if key.code == KeyCode::Char('W') {
+        workflow::open(ui);
+        return;
+    }
+    if let KeyCode::Char(number @ '1'..='5') = key.code {
+        ui.tab = Tab::ALL[(number as u8 - b'1') as usize];
+        on_tab_changed(ui);
         return;
     }
     match key.code {
+        KeyCode::Char('J') => {
+            ui.modal = Some(Modal::Jobs { selected: 0 });
+        }
         KeyCode::Char('q') => {
-            let any_running = ServiceId::ALL
+            if ServiceId::ALL
                 .iter()
                 .any(|id| ui.app.services.status(*id).is_running())
-                || ui.app.switches.list().iter().any(|s| s.state().is_live());
-            if any_running {
+                || ui.app.switches.list().iter().any(|s| s.state().is_live())
+            {
                 ui.modal = Some(Modal::ConfirmQuit);
             } else {
                 ui.should_quit = true;
@@ -609,52 +640,149 @@ fn handle_key(ui: &mut Ui, key: KeyEvent) {
                 cfg.sound
             };
             save_config(ui);
-            // Beep only when switching on — the off-beep would be the last
-            // thing you hear after asking for silence.
             crate::sound::play(enabled, Tone::On);
-            ui.status_msg = Some(if enabled {
-                "sound on".into()
-            } else {
-                "sound off".into()
+            ui.status_msg = Some(if enabled { "sound on" } else { "sound off" }.into());
+        }
+        _ => match ui.tab {
+            Tab::Dashboard => {
+                if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                    ui.dashboard_transfers = !ui.dashboard_transfers;
+                } else if key.code == KeyCode::Char('i') {
+                    cycle_advertise(ui);
+                } else if ui.dashboard_transfers {
+                    handle_sessions_key(ui, key);
+                } else {
+                    handle_services_key(ui, key);
+                }
+            }
+            Tab::Connect => handle_connect_key(ui, key),
+            Tab::Files => handle_transfer_key(ui, key),
+            Tab::Upgrade => handle_switches_key(ui, key),
+            Tab::Logs => handle_logs_key(ui, key),
+        },
+    }
+}
+
+fn handle_mouse(ui: &mut Ui, event: MouseEvent) {
+    if ui.tab != Tab::Upgrade
+        || ui.modal.is_some()
+        || event.kind != MouseEventKind::Down(MouseButton::Left)
+    {
+        return;
+    }
+    let point = Position::new(event.column, event.row);
+    if let Some(button) = ui.upgrade_buttons.iter().find(|b| b.area.contains(point)) {
+        let sw = button.switch.clone();
+        let action = button.action;
+        if action == usize::MAX {
+            ui.modal = Some(Modal::UpgradeActions {
+                switch: sw,
+                selected: 0,
+            });
+        } else {
+            upgrade_action(ui, sw, action);
+        }
+    }
+}
+
+fn handle_cli_key(ui: &mut Ui, key: KeyEvent) {
+    let Some(view) = ui.session_view.as_ref() else {
+        ui.modal = None;
+        return;
+    };
+    if key.code == KeyCode::Esc
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(']'))
+    {
+        let _ = ui.app.engine().submit(Command::CloseCli(view.switch.id));
+        ui.modal = None;
+        ui.status_msg = Some("CLI closed — back in TransferBuddy".into());
+        return;
+    }
+    let bytes = match key.code {
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c.is_ascii() => {
+            vec![(c.to_ascii_uppercase() as u8) & 0x1f]
+        }
+        KeyCode::Char(c) => c.to_string().into_bytes(),
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Backspace => vec![8],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::Home => b"\x1b[H".to_vec(),
+        KeyCode::End => b"\x1b[F".to_vec(),
+        _ => return,
+    };
+    let _ = ui
+        .app
+        .engine()
+        .submit(Command::CliInput(view.switch.id, bytes));
+}
+
+fn handle_connect_key(ui: &mut Ui, key: KeyEvent) {
+    if key.code == KeyCode::Delete {
+        if let Some(sw) = selected_switch(ui) {
+            ui.status_msg = Some(match ui.app.engine().submit(Command::RemoveDevice(sw.id)) {
+                Ok(_) => "device removed".into(),
+                Err(error) => error,
             });
         }
-        KeyCode::Tab | KeyCode::Right => {
-            let i = Tab::ALL.iter().position(|t| *t == ui.tab).unwrap_or(0);
-            ui.tab = Tab::ALL[(i + 1) % Tab::ALL.len()];
-            on_tab_changed(ui);
+        return;
+    }
+    match key.code {
+        KeyCode::Char('a') => activate_upgrade_action(ui, 1),
+        KeyCode::Char('b') => activate_upgrade_action(ui, 2),
+        KeyCode::Char('S') => {
+            if let Some(scan) = ui.app.switches.scan() {
+                scan.cancel();
+            }
         }
-        KeyCode::BackTab | KeyCode::Left => {
-            let i = Tab::ALL.iter().position(|t| *t == ui.tab).unwrap_or(0);
-            ui.tab = Tab::ALL[(i + Tab::ALL.len() - 1) % Tab::ALL.len()];
-            on_tab_changed(ui);
+        KeyCode::Up | KeyCode::Char('k') => ui.switch_sel = ui.switch_sel.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            ui.switch_sel = (ui.switch_sel + 1).min(ui.app.switches.list().len().saturating_sub(1))
         }
-        KeyCode::Char('1') => ui.tab = Tab::Dashboard,
-        KeyCode::Char('2') => ui.tab = Tab::Services,
-        KeyCode::Char('c')
-            if ui.tab != Tab::Files && ui.tab != Tab::Logs && ui.tab != Tab::Upgrade =>
-        {
-            ui.tab = Tab::Services
+        KeyCode::Enter | KeyCode::Char('v') => {
+            if let Some(sw) = selected_switch(ui) {
+                open_session_view(ui, sw);
+            }
         }
-        KeyCode::Char('3') | KeyCode::Char('f') => {
-            ui.tab = Tab::Files;
-            let root = ui.app.config.read().unwrap().root.clone();
-            ui.files.refresh(&root);
+        KeyCode::Char('c') => {
+            if let Some(sw) = selected_switch(ui) {
+                if ui.app.engine().submit(Command::OpenCli(sw.id)).is_ok() {
+                    open_session_view(ui, sw);
+                    ui.modal = Some(Modal::Cli);
+                } else {
+                    ui.status_msg = Some("CLI needs an idle SSH connection".into());
+                }
+            }
         }
-        KeyCode::Char('4') | KeyCode::Char('a') => ui.tab = Tab::Sessions,
-        KeyCode::Char('5') | KeyCode::Char('l') => ui.tab = Tab::Logs,
-        KeyCode::Char('6') | KeyCode::Char('w') if ui.tab != Tab::Services => {
-            ui.tab = Tab::Upgrade;
-            on_tab_changed(ui);
+        KeyCode::Char('r') => {
+            if let Some(sw) = selected_switch(ui) {
+                if sw.state().is_over() {
+                    let _ = ui.app.engine().submit(Command::Reconnect(sw.id));
+                    open_session_view(ui, sw);
+                } else {
+                    let _ = ui.app.engine().submit(Command::Refresh(sw.id));
+                }
+            }
         }
-        KeyCode::Char('i') => cycle_advertise(ui),
-        _ => match ui.tab {
-            Tab::Dashboard => {}
-            Tab::Services => handle_services_key(ui, key),
-            Tab::Files => handle_files_key(ui, key),
-            Tab::Sessions => handle_sessions_key(ui, key),
-            Tab::Logs => handle_logs_key(ui, key),
-            Tab::Upgrade => handle_switches_key(ui, key),
-        },
+        KeyCode::Char('x') => {
+            if let Some(sw) = selected_switch(ui) {
+                disconnect_switch(ui, &sw, "disconnected; r reconnects with saved credentials");
+            }
+        }
+        KeyCode::Char('X') => {
+            ui.app.switches.forget_closed();
+            ui.switch_sel = 0;
+        }
+        KeyCode::Char('y') => {
+            if let Some(sw) = selected_switch(ui) {
+                sw.answer_host_key(true);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -663,6 +791,15 @@ fn on_tab_changed(ui: &mut Ui) {
     if matches!(ui.tab, Tab::Files | Tab::Upgrade) {
         let root = ui.app.config.read().unwrap().root.clone();
         ui.files.refresh(&root);
+    }
+    if ui.tab == Tab::Upgrade
+        && !ui
+            .app
+            .services
+            .status(crate::cisco::service_of(ui.upgrade_protocol))
+            .is_running()
+    {
+        ui.upgrade_protocol = default_deploy_protocol(ui);
     }
 }
 
@@ -750,6 +887,13 @@ fn save_config(ui: &mut Ui) {
 fn handle_services_key(ui: &mut Ui, key: KeyEvent) {
     let id = selected_service(ui);
     match key.code {
+        KeyCode::Char('o') => {
+            ui.modal = Some(Modal::Input {
+                title: "local transfer root".into(),
+                value: ui.app.config.read().unwrap().root.display().to_string(),
+                action: InputAction::Root,
+            })
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             ui.service_sel = ui.service_sel.saturating_sub(1);
         }
@@ -766,7 +910,7 @@ fn handle_services_key(ui: &mut Ui, key: KeyEvent) {
             save_config(ui);
             ui.beep(if enabled { Tone::On } else { Tone::Off });
             if !enabled && ui.app.services.status(id).is_running() {
-                ui.app.services.stop(id);
+                let _ = ui.app.engine().submit(Command::StopService(id));
             }
             ui.status_msg = Some(format!(
                 "{} {}",
@@ -777,7 +921,7 @@ fn handle_services_key(ui: &mut Ui, key: KeyEvent) {
         KeyCode::Char('s') => {
             if ui.app.services.status(id).is_running() {
                 ui.beep(Tone::Off);
-                ui.app.services.stop(id);
+                let _ = ui.app.engine().submit(Command::StopService(id));
             } else {
                 ui.beep(Tone::On);
                 {
@@ -785,20 +929,20 @@ fn handle_services_key(ui: &mut Ui, key: KeyEvent) {
                     cfg.service_mut(id).enabled = true;
                 }
                 save_config(ui);
-                ui.app.services.start(id);
+                let _ = ui.app.engine().submit(Command::StartService(id));
             }
         }
         KeyCode::Char('r') => {
             ui.beep(Tone::Confirm);
-            ui.app.services.restart(id);
+            let _ = ui.app.engine().submit(Command::RestartService(id));
         }
         KeyCode::Char('S') => {
             ui.beep(Tone::On);
-            ui.app.services.start_all_enabled();
+            let _ = ui.app.engine().submit(Command::StartEnabled);
         }
         KeyCode::Char('X') => {
             ui.beep(Tone::Off);
-            ui.app.services.stop_all();
+            let _ = ui.app.engine().submit(Command::StopAll);
         }
         KeyCode::Char('p') => {
             let port = ui.app.config.read().unwrap().service(id).port;
@@ -884,28 +1028,22 @@ fn handle_files_key(ui: &mut Ui, key: KeyEvent) {
                 .map(|e| (*e).clone());
             if let Some(entry) = entry {
                 if entry.is_dir {
-                    if ui.files.cwd.is_empty() {
-                        ui.files.cwd = entry.name.clone();
-                    } else {
-                        ui.files.cwd = format!("{}/{}", ui.files.cwd, entry.name);
-                    }
-                    ui.files.selected = 0;
-                    ui.files.filter.clear();
+                    ui.files.enter(&entry.name);
                     ui.files.refresh(&root);
                 } else {
-                    open_cisco_modal(ui, &entry.name);
+                    request_transfer(ui);
                 }
             }
         }
         KeyCode::Backspace => {
-            if !ui.files.cwd.is_empty() {
-                ui.files.cwd = match ui.files.cwd.rsplit_once('/') {
-                    Some((parent, _)) => parent.to_string(),
-                    None => String::new(),
-                };
-                ui.files.selected = 0;
-                ui.files.refresh(&root);
-            }
+            ui.files.up();
+            ui.files.refresh(&root);
+        }
+        KeyCode::Home => {
+            ui.files.cwd.clear();
+            ui.files.selected = 0;
+            ui.files.filter.clear();
+            ui.files.refresh(&root);
         }
         KeyCode::Char('H') => {
             let entry = ui
@@ -934,20 +1072,7 @@ fn handle_files_key(ui: &mut Ui, key: KeyEvent) {
                 action: InputAction::FileFilter,
             });
         }
-        KeyCode::Char('d') | KeyCode::Char('D') => {
-            let entry = ui
-                .files
-                .visible()
-                .get(ui.files.selected)
-                .map(|e| (*e).clone());
-            if let Some(entry) = entry {
-                if entry.is_dir {
-                    ui.status_msg = Some("deploy works on files, not directories".into());
-                } else {
-                    open_deploy_modal(ui, &entry.name, entry.size);
-                }
-            }
-        }
+        KeyCode::Char('d') | KeyCode::Char('D') => request_transfer(ui),
         KeyCode::Char('R') | KeyCode::F(5) => ui.files.refresh(&root),
         KeyCode::Char('y') => {
             let entry = ui
@@ -965,31 +1090,320 @@ fn handle_files_key(ui: &mut Ui, key: KeyEvent) {
     }
 }
 
+pub fn remote_path(ui: &Ui) -> String {
+    let device = selected_switch(ui)
+        .map(|s| s.facts().flash_device)
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "flash:".into());
+    format!("{device}{}", ui.transfer_ui.remote_cwd)
+}
+
+fn pump_transfer(ui: &mut Ui) {
+    if ui.tab != Tab::Files {
+        return;
+    }
+    ui.switch_sel = ui
+        .switch_sel
+        .min(ui.app.switches.list().len().saturating_sub(1));
+    let Some(sw) = selected_switch(ui) else {
+        return;
+    };
+    if ui.transfer_ui.device != Some(sw.id) {
+        ui.transfer_ui.device = Some(sw.id);
+        ui.transfer_ui.remote_cwd.clear();
+        ui.transfer_ui.remote_selected = 0;
+        ui.transfer_ui.requested = None;
+    }
+    let path = remote_path(ui);
+    if ui.transfer_ui.requested.as_ref() != Some(&path)
+        && sw.state() == SwitchState::Ready
+        && !ui.app.engine().busy(sw.id)
+        && ui
+            .app
+            .engine()
+            .submit(Command::ListRemote(sw.id, path.clone()))
+            .is_ok()
+    {
+        ui.transfer_ui.requested = Some(path);
+    }
+}
+
+fn handle_transfer_key(ui: &mut Ui, key: KeyEvent) {
+    match key.code {
+        KeyCode::Tab => ui.transfer_ui.focus = (ui.transfer_ui.focus + 1) % 3,
+        KeyCode::BackTab => ui.transfer_ui.focus = (ui.transfer_ui.focus + 2) % 3,
+        KeyCode::Left => ui.transfer_ui.focus = 1,
+        KeyCode::Right => ui.transfer_ui.focus = 2,
+
+        KeyCode::Char('v') => {
+            if let Some(sw) = selected_switch(ui) {
+                open_session_view(ui, sw);
+            }
+        }
+        KeyCode::Char('x') => {
+            if let Some(sw) = selected_switch(ui) {
+                disconnect_switch(ui, &sw, "disconnecting device");
+            }
+        }
+        KeyCode::Delete | KeyCode::Char('D') if ui.transfer_ui.focus == 2 => {
+            confirm_remote_delete(ui)
+        }
+        KeyCode::Char('t') => request_transfer(ui),
+        KeyCode::Char('p') => open_transfer_protocol(ui, false, false),
+        _ if ui.transfer_ui.focus == 0 => {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => ui.switch_sel = ui.switch_sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    ui.switch_sel =
+                        (ui.switch_sel + 1).min(ui.app.switches.list().len().saturating_sub(1))
+                }
+                KeyCode::Enter => open_transfer_protocol(ui, false, false),
+                _ => {}
+            }
+            pump_transfer(ui);
+        }
+        _ if ui.transfer_ui.focus == 2 => {
+            let entries = selected_switch(ui)
+                .and_then(|s| s.listing(&remote_path(ui)))
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            let has_parent = !ui.transfer_ui.remote_cwd.is_empty();
+            let count = entries.len() + usize::from(has_parent);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    ui.transfer_ui.remote_selected =
+                        ui.transfer_ui.remote_selected.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    ui.transfer_ui.remote_selected =
+                        (ui.transfer_ui.remote_selected + 1).min(count.saturating_sub(1))
+                }
+                KeyCode::Home => {
+                    ui.transfer_ui.remote_cwd.clear();
+                    ui.transfer_ui.remote_selected = 0;
+                    ui.transfer_ui.requested = None;
+                }
+                KeyCode::Enter if has_parent && ui.transfer_ui.remote_selected == 0 => {
+                    remote_up(ui)
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = entries.get(
+                        ui.transfer_ui
+                            .remote_selected
+                            .saturating_sub(usize::from(has_parent)),
+                    ) {
+                        if entry.is_dir {
+                            ui.transfer_ui.remote_cwd = if has_parent {
+                                format!("{}/{}", ui.transfer_ui.remote_cwd, entry.name)
+                            } else {
+                                entry.name.clone()
+                            };
+                            ui.transfer_ui.remote_selected = 0;
+                            ui.transfer_ui.requested = None;
+                        } else {
+                            request_transfer(ui);
+                        }
+                    }
+                }
+                KeyCode::Backspace => remote_up(ui),
+                KeyCode::Char('R') | KeyCode::F(5) => ui.transfer_ui.requested = None,
+                _ => {}
+            }
+            pump_transfer(ui);
+        }
+        _ => handle_files_key(ui, key),
+    }
+}
+fn remote_up(ui: &mut Ui) {
+    ui.transfer_ui.remote_cwd = ui
+        .transfer_ui
+        .remote_cwd
+        .rsplit_once('/')
+        .map(|(p, _)| p.into())
+        .unwrap_or_default();
+    ui.transfer_ui.remote_selected = 0;
+    ui.transfer_ui.requested = None;
+}
+
+const TRANSFER_PROTOCOL_PRIORITY: [Protocol; 6] = [
+    Protocol::Sftp,
+    Protocol::Https,
+    Protocol::Ftp,
+    Protocol::Http,
+    Protocol::Scp,
+    Protocol::Tftp,
+];
+fn protocol_options(ui: &Ui, receive: bool) -> Vec<Protocol> {
+    transferbuddy_core::engine::protocol_options(&ui.app, receive)
+}
+
+fn confirm_remote_delete(ui: &mut Ui) {
+    let Some(sw) = selected_switch(ui) else {
+        return;
+    };
+    if sw.state() != SwitchState::Ready {
+        ui.status_msg = Some("deletion requires an idle SSH session".into());
+        return;
+    }
+    let path = remote_path(ui);
+    let has_parent = !ui.transfer_ui.remote_cwd.is_empty();
+    if has_parent && ui.transfer_ui.remote_selected == 0 {
+        ui.status_msg = Some("select a file or directory, not ..".into());
+        return;
+    }
+    let Some(entry) = sw.listing(&path).and_then(Result::ok).and_then(|entries| {
+        entries
+            .get(
+                ui.transfer_ui
+                    .remote_selected
+                    .saturating_sub(usize::from(has_parent)),
+            )
+            .cloned()
+    }) else {
+        return;
+    };
+    let path = format!(
+        "{}{}{}",
+        path,
+        if ui.transfer_ui.remote_cwd.is_empty() {
+            ""
+        } else {
+            "/"
+        },
+        entry.name
+    );
+    if let Err(error) = crate::deploy::check_delete_path(&path) {
+        ui.status_msg = Some(error);
+        return;
+    }
+    match ui.app.engine().submit(Command::RequestDelete {
+        device: sw.id,
+        remote: path.clone(),
+        recursive: entry.is_dir,
+    }) {
+        Ok(request) => {
+            ui.modal = Some(Modal::ConfirmDelete {
+                request,
+                switch: sw,
+                path,
+                recursive: entry.is_dir,
+            })
+        }
+        Err(e) => ui.status_msg = Some(e),
+    }
+}
+
+fn open_transfer_protocol(ui: &mut Ui, start: bool, upgrade: bool) {
+    let receive = !upgrade && ui.transfer_ui.focus == 2;
+    let options = protocol_options(ui, receive);
+    let selected = if upgrade {
+        options
+            .iter()
+            .position(|p| *p == ui.upgrade_protocol)
+            .unwrap_or(0)
+    } else {
+        selected_switch(ui)
+            .filter(|s| s.protocol_chosen())
+            .and_then(|s| options.iter().position(|p| *p == s.protocol()))
+            .unwrap_or(0)
+    };
+    ui.modal = Some(Modal::TransferProtocol {
+        options,
+        selected,
+        start,
+        upgrade,
+    });
+}
+fn request_transfer(ui: &mut Ui) {
+    let Some(sw) = selected_switch(ui) else {
+        ui.status_msg = Some("connect a device in 2 Connect first".into());
+        return;
+    };
+    if !sw.protocol_chosen()
+        || !ui
+            .app
+            .services
+            .status(crate::cisco::service_of(sw.protocol()))
+            .is_running()
+        || (ui.transfer_ui.focus == 2 && sw.protocol() != Protocol::Ftp)
+    {
+        open_transfer_protocol(ui, true, false);
+    } else {
+        prepare_transfer(ui);
+    }
+}
+
+fn prepare_transfer(ui: &mut Ui) {
+    let Some(sw) = selected_switch(ui) else {
+        ui.status_msg = Some("connect a device in 2 Connect first".into());
+        return;
+    };
+    let receive = ui.transfer_ui.focus == 2;
+    let name = if receive {
+        let parent = usize::from(!ui.transfer_ui.remote_cwd.is_empty());
+        if parent == 1 && ui.transfer_ui.remote_selected == 0 {
+            return;
+        }
+        sw.listing(&remote_path(ui))
+            .and_then(Result::ok)
+            .and_then(|e| {
+                e.get(ui.transfer_ui.remote_selected.saturating_sub(parent))
+                    .filter(|e| !e.is_dir)
+                    .map(|e| e.name.clone())
+            })
+    } else if ui.transfer_ui.focus == 1 {
+        ui.files
+            .visible()
+            .get(ui.files.selected)
+            .filter(|e| !e.is_dir)
+            .map(|e| e.name.clone())
+    } else {
+        None
+    };
+    let Some(name) = name else {
+        ui.status_msg = Some("select a file".into());
+        return;
+    };
+    let local = if ui.files.cwd.is_empty() {
+        name.clone()
+    } else {
+        format!("{}/{name}", ui.files.cwd)
+    };
+    let remote = format!(
+        "{}{}{name}",
+        remote_path(ui),
+        if ui.transfer_ui.remote_cwd.is_empty() {
+            ""
+        } else {
+            "/"
+        }
+    );
+    match ui.app.engine().submit(Command::Transfer {
+        device: sw.id,
+        local,
+        remote,
+        receive,
+    }) {
+        Ok(_) => {
+            ui.transfer_ui.requested = None;
+            open_session_view(ui, sw);
+        }
+        Err(e) => ui.status_msg = Some(e),
+    }
+}
 fn open_cisco_modal(ui: &mut Ui, name: &str) {
     let rel = if ui.files.cwd.is_empty() {
         name.to_string()
     } else {
         format!("{}/{}", ui.files.cwd, name)
     };
-    let cfg = ui.app.config.read().unwrap();
-    let ip = cfg
-        .advertised_ip("0.0.0.0", None)
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    let mut commands = crate::cisco::commands_for_file(&cfg, &ip, &rel);
-    if commands.is_empty() {
-        // No service enabled yet — show all so the user sees what's possible.
-        for proto in [
-            Protocol::Http,
-            Protocol::Https,
-            Protocol::Ftp,
-            Protocol::Scp,
-            Protocol::Sftp,
-            Protocol::Tftp,
-        ] {
-            commands.push((proto, crate::cisco::copy_command(proto, &cfg, &ip, &rel)));
+    let commands = match transferbuddy_core::engine::copy_commands(&ui.app, &rel) {
+        Ok(commands) => commands,
+        Err(e) => {
+            ui.status_msg = Some(e);
+            return;
         }
-    }
-    drop(cfg);
+    };
     ui.modal = Some(Modal::Cisco {
         rel_path: rel,
         commands,
@@ -998,64 +1412,28 @@ fn open_cisco_modal(ui: &mut Ui, name: &str) {
     });
 }
 
-fn open_hashes_modal(ui: &mut Ui, root: &PathBuf, name: &str) {
+fn open_hashes_modal(ui: &mut Ui, _root: &PathBuf, name: &str) {
     let rel = if ui.files.cwd.is_empty() {
-        name.to_string()
+        name.into()
     } else {
-        format!("{}/{}", ui.files.cwd, name)
+        format!("{}/{name}", ui.files.cwd)
     };
-    let abs = root.join(&rel);
-    ui.status_msg = Some(format!("hashing {rel} …"));
-    match compute_hashes(&abs) {
-        Ok((md5, sha256, sha512)) => {
-            ui.hashes = Some(HashInfo {
-                rel_path: rel,
-                md5,
-                sha256,
-                sha512,
-                compare: None,
-            });
-            ui.status_msg = None;
+    ui.hash_request = Some(rel.clone());
+    match ui.app.engine().submit(Command::Hash(rel)) {
+        Ok(_) => {
+            ui.hashes = None;
             ui.modal = Some(Modal::Hashes);
+            ui.status_msg = Some("hashing in background…".into());
         }
-        Err(e) => ui.modal = Some(Modal::Message(format!("cannot hash {rel}:\n{e}"))),
+        Err(e) => ui.status_msg = Some(e),
     }
 }
 
 /// Stream a file once through all three digests. Cisco images can be hundreds
 /// of megabytes, so read in chunks rather than loading the whole file.
+#[cfg(test)]
 fn compute_hashes(path: &std::path::Path) -> std::io::Result<(String, String, String)> {
-    use md5::Md5;
-    use sha2::{Digest, Sha256, Sha512};
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut md5 = Md5::new();
-    let mut sha256 = Sha256::new();
-    let mut sha512 = Sha512::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        md5.update(&buf[..n]);
-        sha256.update(&buf[..n]);
-        sha512.update(&buf[..n]);
-    }
-    Ok((
-        hex(&md5.finalize()),
-        hex(&sha256.finalize()),
-        hex(&sha512.finalize()),
-    ))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    transferbuddy_core::files::compute_hashes(path)
 }
 
 /// Compare a user-supplied digest against the computed ones. The hash type is
@@ -1098,6 +1476,7 @@ const DEPLOY_PROTOCOLS: [Protocol; 6] = [
 
 /// Open the deploy form for one file. Host, user and destination from the
 /// previous deploy are kept; the passwords are not.
+#[cfg(test)]
 fn open_deploy_modal(ui: &mut Ui, name: &str, size: u64) {
     ui.deploy_mode = DeployMode::Copy;
     ui.pending_deploy = None;
@@ -1129,7 +1508,7 @@ fn open_deploy_modal(ui: &mut Ui, name: &str, size: u64) {
 /// Prefer a protocol whose service is already running, then an enabled one.
 fn default_deploy_protocol(ui: &Ui) -> Protocol {
     let cfg = ui.app.config.read().unwrap();
-    for proto in DEPLOY_PROTOCOLS {
+    for proto in TRANSFER_PROTOCOL_PRIORITY {
         if ui
             .app
             .services
@@ -1139,7 +1518,7 @@ fn default_deploy_protocol(ui: &Ui) -> Protocol {
             return proto;
         }
     }
-    for proto in DEPLOY_PROTOCOLS {
+    for proto in TRANSFER_PROTOCOL_PRIORITY {
         if cfg.service(crate::cisco::service_of(proto)).enabled {
             return proto;
         }
@@ -1158,20 +1537,6 @@ pub fn deploy_command_for(ui: &Ui, form: &DeployForm, rel: &str) -> Result<Strin
         .advertised_ip(&cfg.service(id).bind, peer.as_ref())
         .ok_or_else(|| "no local IP address to advertise to the switch".to_string())?;
     crate::cisco::deploy_command(form.proto, &cfg, &ip, rel, &form.dest)
-}
-
-/// Hide the transfer password that FTP URLs carry, for the log only.
-fn redact_url_password(cmd: &str) -> String {
-    match (cmd.find("://"), cmd.find('@')) {
-        (Some(scheme), Some(at)) if at > scheme => {
-            let creds = &cmd[scheme + 3..at];
-            match creds.split_once(':') {
-                Some((user, _)) => format!("{}{user}:***{}", &cmd[..scheme + 3], &cmd[at..]),
-                None => cmd.to_string(),
-            }
-        }
-        _ => cmd.to_string(),
-    }
 }
 
 /// Show a switch session, following its tail.
@@ -1195,8 +1560,6 @@ fn start_deploy(ui: &mut Ui) {
     };
     let form = view.form.clone();
     let rel = view.rel_path.clone();
-    let size = view.size;
-
     let fail = |ui: &mut Ui, msg: String| {
         if let Some(v) = ui.deploy.as_mut() {
             v.error = Some(msg);
@@ -1263,22 +1626,33 @@ fn start_deploy(ui: &mut Ui) {
                 password: form.password.clone(),
                 enable_password: form.enable_password.clone(),
                 known_hosts,
-                auto_trust: false,
+                auto_trust: ui.app.config.read().unwrap().auto_accept_host_keys,
             })
         }
     };
-    switch.begin_transfer(rel.clone(), size, form.proto);
-    if !switch.submit(Job::Copy {
-        rel_path: rel.clone(),
-        command: command.clone(),
-        overwrite: form.overwrite,
-    }) {
-        return fail(ui, "SSH session is closed — reconnect the device".into());
+    switch.choose_protocol(form.proto);
+    let remote = if form.dest.ends_with(':') || form.dest.ends_with('/') {
+        format!("{}{}", form.dest, rel.rsplit('/').next().unwrap_or(&rel))
+    } else {
+        form.dest.clone()
+    };
+    if let Err(error) = ui.app.engine().submit(Command::QueueTransfers(vec![
+        transferbuddy_core::engine::TransferRequest {
+            device: switch.id,
+            local: rel.clone(),
+            remote,
+            receive: false,
+            protocol: form.proto,
+            overwrite: form.overwrite,
+            platform_check: ui.tab == Tab::Upgrade,
+        },
+    ])) {
+        return fail(ui, error);
     }
 
     let mut ev = Event::new(LogLevel::Info, "deploy", format!("start on {host}"))
         .path(rel)
-        .result(redact_url_password(&command));
+        .result(command.clone());
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         ev = ev.ip(ip);
     }
@@ -1298,6 +1672,10 @@ fn pump_session(ui: &mut Ui) {
     let Some(view) = ui.session_view.as_mut() else {
         return;
     };
+    if matches!(ui.modal, Some(Modal::Cli)) && !view.switch.cli_open() {
+        ui.modal = None;
+        ui.status_msg = Some("CLI session ended — back in TransferBuddy".into());
+    }
     let done = view.switch.jobs_done();
     if done == view.jobs_seen {
         return;
@@ -1320,6 +1698,11 @@ fn pump_session(ui: &mut Ui) {
     };
     ui.app.logger.log(ev);
     ui.beep(tone);
+    if ui.tab == Tab::Files {
+        let root = ui.app.config.read().unwrap().root.clone();
+        ui.files.refresh(&root);
+        ui.transfer_ui.requested = None;
+    }
 }
 
 pub fn deploy_fields(mode: DeployMode) -> &'static [DeployField] {
@@ -1338,7 +1721,7 @@ fn start_deploy_service(ui: &mut Ui, id: ServiceId) {
     }
     ui.app.config.write().unwrap().service_mut(id).enabled = true;
     save_config(ui);
-    ui.app.services.start(id);
+    let _ = ui.app.engine().submit(Command::StartService(id));
     ui.status_msg = Some(format!("{} starting", id.display_name()));
 }
 
@@ -1373,24 +1756,23 @@ fn pump_pending_deploy(ui: &mut Ui) {
 
 /// Validate every entry before opening any connection. Keep the input order
 /// while removing duplicates so bulk pastes cannot add the same device twice.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg(test)]
+struct BulkTargets {
+    direct: Vec<String>,
+    subnets: Vec<String>,
+}
+#[cfg(test)]
+fn bulk_targets(input: &str) -> Result<BulkTargets, String> {
+    let targets = transferbuddy_core::engine::bulk_targets(input)?;
+    Ok(BulkTargets {
+        direct: targets.direct,
+        subnets: targets.subnets,
+    })
+}
+#[cfg(test)]
 fn bulk_hosts(input: &str) -> Result<Vec<String>, String> {
-    let mut hosts = Vec::new();
-    for token in input
-        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-        .filter(|s| !s.is_empty())
-    {
-        let ip: std::net::IpAddr = token
-            .parse()
-            .map_err(|_| format!("invalid IP address: {token}"))?;
-        let host = ip.to_string();
-        if !hosts.contains(&host) {
-            hosts.push(host);
-        }
-    }
-    if hosts.is_empty() {
-        return Err("enter at least one device IP address".into());
-    }
-    Ok(hosts)
+    Ok(bulk_targets(input)?.direct)
 }
 
 fn add_devices(ui: &mut Ui) {
@@ -1398,119 +1780,90 @@ fn add_devices(ui: &mut Ui) {
         return;
     };
     let form = view.form.clone();
-    let hosts = if ui.deploy_mode == DeployMode::Bulk {
-        if form.scan_subnet {
-            crate::switch::subnet_hosts(&form.host)
-        } else {
-            bulk_hosts(&form.host)
-        }
-    } else if form.host.trim().is_empty() {
-        Err("enter the switch IP or hostname".into())
-    } else if form.host.trim().chars().any(char::is_whitespace) {
-        Err("enter one hostname or IP address".into())
-    } else {
-        Ok(vec![form.host.trim().to_string()])
-    };
-    let validated = (|| {
-        let hosts = hosts?;
-        let port = form
-            .port
-            .trim()
-            .parse::<u16>()
-            .ok()
-            .filter(|p| *p > 0)
-            .ok_or_else(|| "invalid SSH port".to_string())?;
-        if form.username.trim().is_empty() {
-            return Err("enter the SSH username".into());
-        }
-        if form.password.is_empty() {
-            return Err("enter the SSH password".into());
-        }
-        crate::deploy::vet(&form.password, crate::deploy::Wire::Secret)?;
-        crate::deploy::vet(&form.enable_password, crate::deploy::Wire::Secret)?;
-        Ok((hosts, port))
-    })();
-    let (hosts, port) = match validated {
-        Ok(values) => values,
-        Err(error) => {
-            if let Some(view) = ui.deploy.as_mut() {
-                view.error = Some(error);
-            }
+    let port = match form.port.trim().parse::<u16>() {
+        Ok(p) if p > 0 => p,
+        _ => {
+            ui.deploy.as_mut().unwrap().error = Some("invalid SSH port".into());
             return;
         }
     };
-    let known_hosts = ui
-        .app
-        .config
-        .read()
-        .unwrap()
-        .config_dir
-        .join("state/known_hosts");
-    if ui.deploy_mode == DeployMode::Bulk && form.scan_subnet {
-        let target = Target {
-            host: String::new(),
+    let credentials = Credentials {
+        username: form.username,
+        password: form.password,
+        enable_password: form.enable_password,
+    };
+    let command = if ui.deploy_mode == DeployMode::Bulk {
+        Command::BulkConnect {
+            targets: form.host,
             port,
-            username: form.username.trim().into(),
-            password: form.password.clone(),
-            enable_password: form.enable_password.clone(),
-            known_hosts,
-            auto_trust: true,
-        };
-        if let Err(error) = ui.app.switches.start_scan(target, &form.host, form.proto) {
-            if let Some(view) = ui.deploy.as_mut() {
-                view.error = Some(error);
+            credentials,
+        }
+    } else {
+        Command::Connect {
+            host: form.host,
+            port,
+            credentials,
+            bulk: false,
+        }
+    };
+    match ui.app.engine().submit(command) {
+        Ok(_) => {
+            ui.deploy.as_mut().unwrap().form.password.clear();
+            ui.deploy.as_mut().unwrap().form.enable_password.clear();
+            ui.modal = None;
+            ui.tab = Tab::Connect;
+            if ui.deploy_mode == DeployMode::Add {
+                if let Some(sw) = ui.app.switches.list().last().cloned() {
+                    open_session_view(ui, sw);
+                }
             }
-            return;
+            ui.status_msg =
+                Some("connecting — failures appear in Logs; S cancels subnet discovery".into());
         }
-        if let Some(view) = ui.deploy.as_mut() {
-            view.form.password.clear();
-            view.form.enable_password.clear();
-        }
-        ui.tab = Tab::Upgrade;
-        ui.upgrade_menu = None;
-        ui.modal = None;
-        ui.status_msg = Some(
-            "experimental subnet scan started — live ping/SSH progress; S cancels discovery".into(),
-        );
-        return;
+        Err(error) => ui.deploy.as_mut().unwrap().error = Some(error),
     }
-    let mut added = 0;
-    for host in hosts {
-        let switch = ui
-            .app
-            .switches
-            .find_live(&host, port, form.username.trim())
-            .unwrap_or_else(|| {
-                added += 1;
-                ui.app.switches.connect(Target {
-                    host,
-                    port,
-                    username: form.username.trim().into(),
-                    password: form.password.clone(),
-                    enable_password: form.enable_password.clone(),
-                    known_hosts: known_hosts.clone(),
-                    auto_trust: ui.deploy_mode == DeployMode::Bulk,
-                })
-            });
-        switch.set_protocol(form.proto);
-    }
-    if let Some(view) = ui.deploy.as_mut() {
-        view.form.password.clear();
-        view.form.enable_password.clear();
-    }
-    ui.tab = Tab::Upgrade;
-    ui.upgrade_menu = None;
-    ui.modal = None;
-    ui.status_msg = Some(format!(
-        "{added} device(s) added — checking SSH; deploy starts separately with d"
-    ));
 }
 
 fn handle_paste(ui: &mut Ui, text: String) {
+    if matches!(ui.modal, Some(Modal::Workflow)) {
+        workflow::paste(ui, text);
+        return;
+    }
+    if let Some(Modal::WorkflowLogin { form, .. }) = &mut ui.modal {
+        match form.field {
+            1 => &mut form.password,
+            2 => &mut form.enable_password,
+            _ => &mut form.username,
+        }
+        .push_str(&text.replace(['\r', '\n'], ""));
+        return;
+    }
+    if matches!(ui.modal, Some(Modal::CoreQuestion(_))) {
+        ui.status_msg = Some("Paste cannot approve a confirmation".into());
+        return;
+    }
+    if matches!(
+        ui.modal,
+        Some(Modal::ConfirmDelete { .. } | Modal::ConfirmInstall { .. })
+    ) {
+        ui.modal = None;
+        return;
+    }
+
+    if matches!(ui.modal, Some(Modal::Cli)) {
+        if let Some(view) = ui.session_view.as_ref() {
+            view.switch.cli_send(text.replace('\n', "\r").into_bytes());
+        }
+        return;
+    }
     if matches!(ui.modal, Some(Modal::Session)) {
         if let Some(view) = &ui.session_view {
-            if matches!(view.switch.state(), SwitchState::CleanupConfirm { .. }) {
+            if matches!(
+                view.switch.state(),
+                SwitchState::CleanupConfirm { .. } | SwitchState::ReloadConfirm { .. }
+            ) {
                 view.switch.answer_cleanup(false);
+                view.switch.answer_reload(false);
                 return;
             }
         }
@@ -1557,15 +1910,10 @@ fn handle_upgrade_files_key(ui: &mut Ui, key: KeyEvent) {
                 .files
                 .visible()
                 .get(ui.files.selected)
-                .map(|e| ((*e).name.clone(), e.is_dir, e.size));
+                .map(|e| (e.name.clone(), e.is_dir, e.size));
             if let Some((name, is_dir, size)) = entry {
                 if is_dir {
-                    ui.files.cwd = if ui.files.cwd.is_empty() {
-                        name
-                    } else {
-                        format!("{}/{name}", ui.files.cwd)
-                    };
-                    ui.files.selected = 0;
+                    ui.files.enter(&name);
                     ui.files.refresh(&root);
                 } else {
                     let rel = if ui.files.cwd.is_empty() {
@@ -1586,13 +1934,13 @@ fn handle_upgrade_files_key(ui: &mut Ui, key: KeyEvent) {
                 (ui.files.selected + 1).min(ui.files.visible().len().saturating_sub(1))
         }
         KeyCode::Backspace => {
-            ui.files.cwd = ui
-                .files
-                .cwd
-                .rsplit_once('/')
-                .map(|(parent, _)| parent.to_string())
-                .unwrap_or_default();
+            ui.files.up();
+            ui.files.refresh(&root);
+        }
+        KeyCode::Home => {
+            ui.files.cwd.clear();
             ui.files.selected = 0;
+            ui.files.filter.clear();
             ui.files.refresh(&root);
         }
         KeyCode::Char('R') => ui.files.refresh(&root),
@@ -1640,14 +1988,10 @@ fn handle_deploy_key(ui: &mut Ui, key: KeyEvent) {
             view.form.field = (view.form.field + 1).min(fields.len() - 1)
         }
         KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
-            if matches!(
-                cur,
-                DeployField::Protocol | DeployField::Overwrite | DeployField::ScanSubnet
-            ) =>
+            if matches!(cur, DeployField::Protocol | DeployField::Overwrite) =>
         {
             match cur {
                 DeployField::Overwrite => view.form.overwrite = !view.form.overwrite,
-                DeployField::ScanSubnet => view.form.scan_subnet = !view.form.scan_subnet,
                 _ => {
                     let i = DEPLOY_PROTOCOLS
                         .iter()
@@ -1699,18 +2043,25 @@ fn handle_session_key(ui: &mut Ui, key: KeyEvent) {
         }
         return;
     }
+    if matches!(switch.state(), SwitchState::ReloadConfirm { .. }) {
+        switch.answer_reload(key.code == KeyCode::Char('y') && key.modifiers.is_empty());
+        return;
+    }
     if matches!(switch.state(), SwitchState::CleanupConfirm { .. }) {
         switch.answer_cleanup(key.code == KeyCode::Char('y') && key.modifiers.is_empty());
         return;
     }
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => ui.modal = None,
+        KeyCode::Char('R') if switch.state().is_over() => {
+            let _ = ui.app.engine().submit(Command::Reconnect(switch.id));
+        }
         KeyCode::Char('i') => start_cleanup(ui, switch),
         KeyCode::Char('c') => {
             disconnect_switch(ui, &switch, "cancelled — the session is closed with it");
         }
         KeyCode::Char('r') => {
-            if ui.app.switches.refresh_facts(switch.clone()) {
+            if ui.app.engine().submit(Command::Refresh(switch.id)).is_ok() {
                 ui.status_msg = Some("re-reading dir and show version".into());
             }
         }
@@ -1722,9 +2073,10 @@ fn handle_session_key(ui: &mut Ui, key: KeyEvent) {
 /// Stop a session whatever it is doing: a queued `exit` only helps a session
 /// that is idle, so the abort flag is set as well.
 fn disconnect_switch(ui: &mut Ui, switch: &Arc<Switch>, msg: &str) {
-    switch.submit(Job::Disconnect);
-    switch.cancel();
-    ui.status_msg = Some(msg.to_string());
+    match ui.app.engine().submit(Command::Disconnect(switch.id)) {
+        Ok(_) => ui.status_msg = Some(msg.into()),
+        Err(e) => ui.status_msg = Some(e),
+    }
 }
 
 fn field_buffer(form: &mut DeployForm, field: DeployField) -> &mut String {
@@ -1736,10 +2088,7 @@ fn field_buffer(form: &mut DeployForm, field: DeployField) -> &mut String {
         DeployField::EnablePassword => &mut form.enable_password,
         DeployField::Destination => &mut form.dest,
         // Not text fields; never reached, but a buffer has to be returned.
-        DeployField::Protocol
-        | DeployField::Overwrite
-        | DeployField::ScanSubnet
-        | DeployField::Submit => &mut form.dest,
+        DeployField::Protocol | DeployField::Overwrite | DeployField::Submit => &mut form.dest,
     }
 }
 
@@ -1778,31 +2127,14 @@ fn selected_switch(ui: &Ui) -> Option<Arc<Switch>> {
         .cloned()
 }
 
-const UPGRADE_ACTIONS: [&str; 5] = [
-    "Choose file",
-    "Add device +",
-    "Bulk import",
-    "Deploy selected",
-    "Remove inactive",
-];
-
 fn start_cleanup(ui: &mut Ui, switch: Arc<Switch>) {
-    if switch.state() != SwitchState::Ready {
-        ui.status_msg = Some("cleanup requires an idle, connected device".into());
-        return;
-    }
-    if switch.submit(Job::RemoveInactive) {
-        open_session_view(ui, switch);
+    match ui.app.engine().submit(Command::RemoveInactive(switch.id)) {
+        Ok(_) => open_session_view(ui, switch),
+        Err(e) => ui.status_msg = Some(e),
     }
 }
-
 fn activate_upgrade_action(ui: &mut Ui, action: usize) {
     match action {
-        4 => {
-            if let Some(sw) = selected_switch(ui) {
-                start_cleanup(ui, sw);
-            }
-        }
         0 => {
             let root = ui.app.config.read().unwrap().root.clone();
             ui.files.refresh(&root);
@@ -1817,7 +2149,6 @@ fn activate_upgrade_action(ui: &mut Ui, action: usize) {
             let mut form = DeployForm::default();
             if let Some(previous) = &ui.deploy {
                 form.username = previous.form.username.clone();
-                form.proto = previous.form.proto;
             }
             ui.deploy = Some(DeployView {
                 rel_path: String::new(),
@@ -1827,110 +2158,249 @@ fn activate_upgrade_action(ui: &mut Ui, action: usize) {
             });
             ui.modal = Some(Modal::Deploy);
         }
-        3 => {
-            let Some((rel_path, size)) = ui.upgrade_file.clone() else {
-                ui.status_msg = Some("choose a file first (f)".into());
-                return;
-            };
-            let Some(switch) = selected_switch(ui) else {
-                ui.status_msg = Some("add a device first (a / b)".into());
-                return;
-            };
-            if switch.state().is_over() {
-                ui.status_msg = Some("device is disconnected — add it again to reconnect".into());
-                return;
+        3 => deploy_upgrade(ui),
+        4 => {
+            if let Some(sw) = selected_switch(ui) {
+                start_cleanup(ui, sw);
             }
-            let form = DeployForm {
-                host: switch.host.clone(),
-                port: switch.port.to_string(),
-                username: switch.username.clone(),
-                proto: switch.protocol(),
-                field: DeployField::ALL
-                    .iter()
-                    .position(|f| *f == DeployField::Protocol)
-                    .unwrap(),
-                ..DeployForm::default()
-            };
-            ui.deploy_mode = DeployMode::Copy;
-            ui.deploy = Some(DeployView {
-                rel_path,
-                size,
-                form,
-                error: None,
-            });
-            ui.modal = Some(Modal::Deploy);
         }
         _ => {}
     }
 }
+fn selected_local_file(ui: &Ui) -> Option<(String, u64)> {
+    let entries = ui.files.visible();
+    let entry = entries.get(ui.files.selected)?;
+    if entry.is_dir {
+        return None;
+    }
+    Some((
+        if ui.files.cwd.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{}/{}", ui.files.cwd, entry.name)
+        },
+        entry.size,
+    ))
+}
+pub const UPGRADE_JOB_ACTIONS: [&str; 5] = [
+    "d: Deploy + MD5",
+    "V: Verify existing image",
+    "u: Upgrade",
+    "Y: YOLO upgrade",
+    "i: Remove inactive",
+];
+fn confirm_install(ui: &mut Ui, sw: Arc<Switch>, yolo: bool) {
+    match ui.app.engine().submit(Command::RequestInstall {
+        device: sw.id,
+        yolo,
+    }) {
+        Ok(request) => {
+            ui.modal = Some(Modal::ConfirmInstall {
+                request,
+                switch: sw,
+                yolo,
+            })
+        }
+        Err(e) => ui.status_msg = Some(e),
+    }
+}
+fn upgrade_action(ui: &mut Ui, sw: Arc<Switch>, action: usize) {
+    if let Some(index) = ui.app.switches.list().iter().position(|s| s.id == sw.id) {
+        ui.switch_sel = index;
+    } else {
+        return;
+    }
+    match action {
+        0 => deploy_upgrade(ui),
+        1 => verify_existing_upgrade(ui),
+        2 => confirm_install(ui, sw, false),
+        3 => confirm_install(ui, sw, true),
+        4 => start_cleanup(ui, sw),
+        _ => {}
+    }
+}
+fn verify_existing_upgrade(ui: &mut Ui) {
+    let Some(sw) = selected_switch(ui) else {
+        return;
+    };
+    let Some(file) = ui
+        .upgrade_assignments
+        .get(&sw.id)
+        .cloned()
+        .or_else(|| ui.upgrade_file.clone())
+        .or_else(|| selected_local_file(ui))
+    else {
+        ui.status_msg = Some("assign a local image for comparison first".into());
+        return;
+    };
+    assign_upgrade(ui, &sw, file);
+    match ui.app.engine().submit(Command::Verify(sw.id)) {
+        Ok(_) => open_session_view(ui, sw),
+        Err(e) => ui.status_msg = Some(e),
+    }
+}
 
 fn handle_switches_key(ui: &mut Ui, key: KeyEvent) {
-    let count = ui.app.switches.list().len();
     match key.code {
-        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+        KeyCode::Tab | KeyCode::BackTab => {
             ui.upgrade_menu = if ui.upgrade_menu.is_some() {
                 None
             } else {
                 Some(0)
-            };
+            }
         }
-        KeyCode::Char('a') => activate_upgrade_action(ui, 1),
-        KeyCode::Char('b') => activate_upgrade_action(ui, 2),
+        KeyCode::Char('p') => open_transfer_protocol(ui, false, true),
         KeyCode::Char('f') => activate_upgrade_action(ui, 0),
-        KeyCode::Char('d') => activate_upgrade_action(ui, 3),
-        KeyCode::Char('i') => activate_upgrade_action(ui, 4),
-        KeyCode::Char('S') => {
-            if let Some(scan) = ui.app.switches.scan() {
-                scan.cancel();
+        KeyCode::Char('A') => {
+            if let Some(file) = ui.upgrade_file.clone().or_else(|| selected_local_file(ui)) {
+                for sw in ui.app.switches.list() {
+                    assign_upgrade(ui, &sw, file.clone());
+                }
+                ui.status_msg = Some("file assigned to all devices".into());
             }
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(menu) = ui.upgrade_menu.as_mut() {
-                *menu = menu.saturating_sub(1);
+        KeyCode::Char('a') => {
+            if let (Some(file), Some(sw)) = (
+                ui.upgrade_file.clone().or_else(|| selected_local_file(ui)),
+                selected_switch(ui),
+            ) {
+                assign_upgrade(ui, &sw, file);
+                ui.status_msg = Some("file assigned to selected device".into());
+            }
+        }
+        KeyCode::Char('d') => deploy_upgrade(ui),
+        KeyCode::Char('i') => {
+            if let Some(sw) = selected_switch(ui) {
+                start_cleanup(ui, sw);
+            }
+        }
+        KeyCode::Char('V') => verify_existing_upgrade(ui),
+        KeyCode::Char('u') | KeyCode::Char('Y') => {
+            if let Some(sw) = selected_switch(ui) {
+                confirm_install(ui, sw, key.code == KeyCode::Char('Y'));
+            }
+        }
+        _ if ui.upgrade_menu.is_some() => {
+            if key.code == KeyCode::Enter {
+                if let Some(file) = selected_local_file(ui) {
+                    ui.upgrade_file = Some(file);
+                    ui.upgrade_menu = None;
+                } else {
+                    handle_upgrade_browser(ui, key);
+                }
             } else {
-                ui.switch_sel = ui.switch_sel.saturating_sub(1);
+                handle_upgrade_browser(ui, key);
             }
         }
+        KeyCode::Up | KeyCode::Char('k') => ui.switch_sel = ui.switch_sel.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(menu) = ui.upgrade_menu.as_mut() {
-                *menu = (*menu + 1).min(UPGRADE_ACTIONS.len() - 1);
-            } else if count > 0 {
-                ui.switch_sel = (ui.switch_sel + 1).min(count - 1);
-            }
+            ui.switch_sel = (ui.switch_sel + 1).min(ui.app.switches.list().len().saturating_sub(1))
         }
         KeyCode::Enter => {
-            if let Some(menu) = ui.upgrade_menu {
-                activate_upgrade_action(ui, menu);
-            } else if let Some(sw) = selected_switch(ui) {
+            if let Some(sw) = selected_switch(ui) {
+                let selected = if crate::upgrade::install_blocker(
+                    &sw.upgrade(),
+                    &sw.facts().version.unwrap_or_default(),
+                )
+                .is_none()
+                {
+                    2
+                } else {
+                    0
+                };
+                ui.modal = Some(Modal::UpgradeActions {
+                    switch: sw,
+                    selected,
+                });
+            }
+        }
+        KeyCode::Char('v') => {
+            if let Some(sw) = selected_switch(ui) {
                 open_session_view(ui, sw);
             }
         }
-        KeyCode::Char('r') => {
-            if let Some(sw) = selected_switch(ui) {
-                if ui.app.switches.refresh_facts(sw.clone()) {
-                    ui.status_msg = Some(format!("re-reading facts of {}", sw.display_name()));
+        _ => {}
+    }
+}
+fn handle_upgrade_browser(ui: &mut Ui, key: KeyEvent) {
+    let root = ui.app.config.read().unwrap().root.clone();
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => ui.files.selected = ui.files.selected.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            ui.files.selected =
+                (ui.files.selected + 1).min(ui.files.visible().len().saturating_sub(1))
+        }
+        KeyCode::Enter => {
+            let entry = ui
+                .files
+                .visible()
+                .get(ui.files.selected)
+                .map(|e| (*e).clone());
+            if let Some(entry) = entry {
+                if entry.is_dir {
+                    ui.files.enter(&entry.name);
+                    ui.files.refresh(&root);
                 }
             }
         }
-        KeyCode::Char('x') | KeyCode::Char('c') => {
-            if let Some(sw) = selected_switch(ui) {
-                let msg = format!("disconnecting {}", sw.display_name());
-                disconnect_switch(ui, &sw, &msg);
-            }
+        KeyCode::Backspace => {
+            ui.files.up();
+            ui.files.refresh(&root);
         }
-        KeyCode::Char('y') => {
-            if let Some(sw) = selected_switch(ui) {
-                if matches!(sw.state(), SwitchState::HostKey { .. }) {
-                    sw.answer_host_key(true);
-                }
-            }
+        KeyCode::Home => {
+            ui.files.cwd.clear();
+            ui.files.selected = 0;
+            ui.files.filter.clear();
+            ui.files.refresh(&root);
         }
-        KeyCode::Char('X') => {
-            ui.app.switches.forget_closed();
-            ui.switch_sel = 0;
+        KeyCode::Char('R') | KeyCode::F(5) => ui.files.refresh(&root),
+        KeyCode::Char('/') => {
+            ui.modal = Some(Modal::Input {
+                title: "filter files".into(),
+                value: ui.files.filter.clone(),
+                action: InputAction::FileFilter,
+            })
         }
         _ => {}
     }
+}
+fn assign_upgrade(ui: &mut Ui, switch: &Arc<Switch>, file: (String, u64)) {
+    match ui.app.engine().submit(Command::AssignImage {
+        devices: vec![switch.id],
+        local: file.0.clone(),
+    }) {
+        Ok(_) => {
+            ui.upgrade_assignments.insert(switch.id, file);
+        }
+        Err(e) => ui.status_msg = Some(e),
+    }
+}
+
+fn deploy_upgrade(ui: &mut Ui) {
+    let Some(sw) = selected_switch(ui) else {
+        return;
+    };
+    let Some(file) = ui
+        .upgrade_assignments
+        .get(&sw.id)
+        .cloned()
+        .or_else(|| ui.upgrade_file.clone())
+        .or_else(|| selected_local_file(ui))
+    else {
+        ui.status_msg = Some("assign a local image first".into());
+        return;
+    };
+    assign_upgrade(ui, &sw, file);
+    match ui
+        .app
+        .engine()
+        .submit(Command::Deploy(sw.id, ui.upgrade_protocol))
+    {
+        Ok(_) => open_session_view(ui, sw),
+        Err(e) => ui.status_msg = Some(e),
+    }
+}
+fn pump_upgrades(_ui: &mut Ui) { /* Jobs are driven by the shared async engine. */
 }
 fn handle_sessions_key(ui: &mut Ui, key: KeyEvent) {
     match key.code {
@@ -1991,6 +2461,184 @@ fn handle_logs_key(ui: &mut Ui, key: KeyEvent) {
 fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
     let mut modal = ui.modal.take();
     match &mut modal {
+        Some(Modal::Workflow) => {
+            ui.modal = modal;
+            workflow::key(ui, key);
+        }
+        Some(Modal::WorkflowLogin { device, form }) => {
+            if workflow::login_key(ui, *device, form, key) {
+                ui.modal = modal;
+            } else {
+                ui.modal = Some(Modal::Workflow);
+            }
+        }
+        Some(Modal::CoreQuestion(question)) => {
+            let _ = ui.app.engine().submit(Command::Reply {
+                request: question.id,
+                input: if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
+                    "y"
+                } else {
+                    "n"
+                }
+                .into(),
+            });
+        }
+        Some(Modal::Jobs { selected }) => {
+            let jobs: Vec<_> = ui
+                .app
+                .engine()
+                .snapshot()
+                .operations
+                .into_iter()
+                .filter(|o| o.transfer.is_some())
+                .collect();
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => return,
+                KeyCode::Up => *selected = selected.saturating_sub(1),
+                KeyCode::Down => *selected = (*selected + 1).min(jobs.len().saturating_sub(1)),
+                KeyCode::Char('r' | 'c' | 's' | 'v' | 'S' | 'o') => {
+                    if let Some(job) = jobs.get(*selected) {
+                        let command = match key.code {
+                            KeyCode::Char('r') => Some(Command::RetryOperation(job.id)),
+                            KeyCode::Char('c') => Some(Command::CancelOperation(job.id)),
+                            KeyCode::Char('v') => Some(Command::InspectOperation(job.id)),
+                            KeyCode::Char('s') => {
+                                job.device.map(|d| Command::ReviewPending(vec![d]))
+                            }
+                            KeyCode::Char('S') => {
+                                job.device.map(|d| Command::ResumeReviewed(vec![d]))
+                            }
+                            KeyCode::Char('o') => Some(Command::RequestOverwriteRetry(job.id)),
+                            _ => None,
+                        };
+                        if let Some(command) = command {
+                            match ui.app.engine().submit(command) {
+                                Err(error) => ui.status_msg = Some(error),
+                                Ok(id) if key.code == KeyCode::Char('o') => {
+                                    if let Some(question) = ui
+                                        .app
+                                        .engine()
+                                        .pending_confirmations()
+                                        .into_iter()
+                                        .find(|c| c.id == id)
+                                    {
+                                        ui.modal = Some(Modal::CoreQuestion(question));
+                                        return;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            ui.modal = modal;
+        }
+        Some(Modal::TransferProtocol {
+            options,
+            selected,
+            start,
+            upgrade,
+        }) => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+                ui.modal = modal;
+            }
+            KeyCode::Down => {
+                *selected = (*selected + 1).min(options.len().saturating_sub(1));
+                ui.modal = modal;
+            }
+            KeyCode::Enter => {
+                let protocol = options[*selected];
+                if *upgrade {
+                    ui.upgrade_protocol = protocol;
+                } else if let Some(sw) = selected_switch(ui) {
+                    let _ = ui
+                        .app
+                        .engine()
+                        .submit(Command::ChooseProtocol(sw.id, protocol));
+                }
+                if *start {
+                    prepare_transfer(ui);
+                }
+            }
+            _ => ui.modal = modal,
+        },
+        Some(Modal::ConfirmDelete {
+            request, switch, ..
+        }) => {
+            let yes = key.code == KeyCode::Char('y') && key.modifiers.is_empty();
+            let answer = if yes { "y" } else { "n" };
+            let sw = switch.clone();
+            match ui.app.engine().submit(Command::Reply {
+                request: *request,
+                input: answer.into(),
+            }) {
+                Ok(_) if yes => {
+                    ui.transfer_ui.requested = None;
+                    open_session_view(ui, sw);
+                }
+                Ok(_) => ui.status_msg = Some("deletion cancelled".into()),
+                Err(e) => ui.status_msg = Some(e),
+            }
+        }
+        Some(Modal::UpgradeActions { switch, selected }) => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+                ui.modal = modal;
+            }
+            KeyCode::Down => {
+                *selected = (*selected + 1).min(UPGRADE_JOB_ACTIONS.len() - 1);
+                ui.modal = modal;
+            }
+            KeyCode::Enter => {
+                let sw = switch.clone();
+                let action = *selected;
+                upgrade_action(ui, sw, action);
+            }
+            KeyCode::Char('d') => {
+                let sw = switch.clone();
+                upgrade_action(ui, sw, 0);
+            }
+            KeyCode::Char('V') => {
+                let sw = switch.clone();
+                upgrade_action(ui, sw, 1);
+            }
+            KeyCode::Char('u') => {
+                let sw = switch.clone();
+                upgrade_action(ui, sw, 2);
+            }
+            KeyCode::Char('Y') => {
+                let sw = switch.clone();
+                upgrade_action(ui, sw, 3);
+            }
+            KeyCode::Char('i') => {
+                let sw = switch.clone();
+                upgrade_action(ui, sw, 4);
+            }
+            _ => ui.modal = modal,
+        },
+        Some(Modal::ConfirmInstall {
+            request, switch, ..
+        }) => {
+            let yes = key.code == KeyCode::Char('y') && key.modifiers.is_empty();
+            let sw = switch.clone();
+            match ui.app.engine().submit(Command::Reply {
+                request: *request,
+                input: if yes { "y" } else { "n" }.into(),
+            }) {
+                Ok(_) if yes => open_session_view(ui, sw),
+                Ok(_) => ui.status_msg = Some("upgrade cancelled".into()),
+                Err(e) => ui.status_msg = Some(e),
+            }
+        }
+        Some(Modal::Cli) => {
+            ui.modal = modal;
+            handle_cli_key(ui, key);
+        }
         Some(Modal::ConfirmStart { id }) => {
             let id = *id;
             ui.modal = Some(Modal::Deploy);
@@ -1998,7 +2646,6 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
                 start_deploy_service(ui, id);
                 ui.pending_deploy = Some((id, Instant::now()));
             }
-            return;
         }
         Some(Modal::DeployProtocol { selected }) => {
             match key.code {
@@ -2030,34 +2677,28 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
                 _ => {}
             }
             ui.modal = modal;
-            return;
         }
         Some(Modal::UpgradeFiles) => {
             ui.modal = modal;
             handle_upgrade_files_key(ui, key);
-            return;
         }
         Some(Modal::Help) => match key.code {
             // The two key tables can be taller than the terminal.
             KeyCode::Up | KeyCode::Char('k') => {
                 ui.help_scroll = ui.help_scroll.saturating_sub(1);
                 ui.modal = modal;
-                return;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 ui.help_scroll += 1;
                 ui.modal = modal;
-                return;
             }
             KeyCode::PageUp => {
                 ui.help_scroll = ui.help_scroll.saturating_sub(10);
                 ui.modal = modal;
-                return;
             }
             KeyCode::PageDown => {
                 ui.help_scroll += 10;
                 ui.modal = modal;
-                return;
             }
             // Any other key closes.
             _ => {}
@@ -2067,7 +2708,7 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
         }
         Some(Modal::ConfirmQuit) => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                ui.app.services.stop_all();
+                let _ = ui.app.engine().submit(Command::StopAll);
                 ui.app.switches.disconnect_all();
                 ui.should_quit = true;
             }
@@ -2087,12 +2728,10 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 value.push(c);
                 ui.modal = modal;
-                return;
             }
             KeyCode::Backspace => {
                 value.pop();
                 ui.modal = modal;
-                return;
             }
             KeyCode::Enter => {
                 let (action, value) = (*action, value.clone());
@@ -2100,7 +2739,6 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
             }
             _ => {
                 ui.modal = modal;
-                return;
             }
         },
         Some(Modal::Cisco {
@@ -2113,13 +2751,11 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
                 *selected = selected.saturating_sub(1);
                 *copied = false;
                 ui.modal = modal;
-                return;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 *selected = (*selected + 1).min(commands.len().saturating_sub(1));
                 *copied = false;
                 ui.modal = modal;
-                return;
             }
             KeyCode::Char('y') | KeyCode::Enter => {
                 if let Some((_, cmd)) = commands.get(*selected) {
@@ -2132,7 +2768,6 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
                     }
                 }
                 ui.modal = modal;
-                return;
             }
             KeyCode::Char('i') => {
                 let rel = match &modal {
@@ -2150,12 +2785,10 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
                 );
                 open_cisco_modal(ui, &name);
                 ui.files.cwd = keep_cwd;
-                return;
             }
             KeyCode::Esc | KeyCode::Char('q') => {}
             _ => {
                 ui.modal = modal;
-                return;
             }
         },
         Some(Modal::ServiceEdit { id, field, editing }) => {
@@ -2210,17 +2843,14 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
                 _ => {}
             }
             ui.modal = modal;
-            return;
         }
         Some(Modal::Deploy) => {
             ui.modal = modal;
             handle_deploy_key(ui, key);
-            return;
         }
         Some(Modal::Session) => {
             ui.modal = modal;
             handle_session_key(ui, key);
-            return;
         }
         Some(Modal::Hashes) => match key.code {
             KeyCode::Char('c') => {
@@ -2229,12 +2859,10 @@ fn handle_modal_key(ui: &mut Ui, key: KeyEvent) {
                     value: String::new(),
                     action: InputAction::HashCompare,
                 });
-                return;
             }
             KeyCode::Esc | KeyCode::Char('q') => {}
             _ => {
                 ui.modal = modal;
-                return;
             }
         },
         None => {}
@@ -2261,7 +2889,7 @@ fn activate_service_field(ui: &mut Ui, id: ServiceId, field: EditField) {
         EditField::StartStop => {
             if ui.app.services.status(id).is_running() {
                 ui.beep(Tone::Off);
-                ui.app.services.stop(id);
+                let _ = ui.app.engine().submit(Command::StopService(id));
                 ui.status_msg = Some(format!("{} stopping", id.display_name()));
             } else {
                 {
@@ -2270,7 +2898,7 @@ fn activate_service_field(ui: &mut Ui, id: ServiceId, field: EditField) {
                 }
                 save_config(ui);
                 ui.beep(Tone::On);
-                ui.app.services.start(id);
+                let _ = ui.app.engine().submit(Command::StartService(id));
                 ui.status_msg = Some(format!("{} starting", id.display_name()));
             }
         }
@@ -2284,7 +2912,7 @@ fn activate_service_field(ui: &mut Ui, id: ServiceId, field: EditField) {
             save_config(ui);
             ui.beep(if enabled { Tone::On } else { Tone::Off });
             if !enabled && ui.app.services.status(id).is_running() {
-                ui.app.services.stop(id);
+                let _ = ui.app.engine().submit(Command::StopService(id));
             }
             ui.status_msg = Some(format!(
                 "{} {}",
@@ -2318,151 +2946,75 @@ fn commit_service_edit(
     field: EditField,
     value: String,
 ) -> Option<String> {
-    match field {
-        EditField::Port => match value.trim().parse::<u16>() {
-            Ok(port) if port > 0 => {
-                if port < 1024 && !ui.app.privileged {
-                    return Some(format!("port {port} needs root — run with sudo"));
-                }
-                {
-                    let mut cfg = ui.app.config.write().unwrap();
-                    cfg.service_mut(id).port = port;
-                }
-                save_config(ui);
-                if ui.app.services.status(id).is_running() {
-                    ui.app.services.restart(id);
-                }
-                ui.status_msg = Some(format!("{} port set to {port}", id.display_name()));
-                None
-            }
-            _ => Some(format!("invalid port: {value}")),
-        },
-        EditField::Bind => match value.trim().parse::<std::net::IpAddr>() {
-            Ok(_) => {
-                {
-                    let mut cfg = ui.app.config.write().unwrap();
-                    cfg.service_mut(id).bind = value.trim().to_string();
-                }
-                save_config(ui);
-                if ui.app.services.status(id).is_running() {
-                    ui.app.services.restart(id);
-                }
-                ui.status_msg = Some(format!(
-                    "{} bind set to {}",
-                    id.display_name(),
-                    value.trim()
-                ));
-                None
-            }
-            Err(_) => Some(format!("invalid bind address: {value}")),
-        },
-        EditField::Username => {
-            if value.trim().is_empty() {
-                return Some("username must not be empty".into());
-            }
-            ui.app.config.write().unwrap().auth.username = value.trim().to_string();
-            save_config(ui);
-            restart_auth_services(ui);
-            ui.status_msg = Some("username updated".into());
-            None
-        }
-        EditField::Password => {
-            if value.is_empty() {
-                return Some("password must not be empty".into());
-            }
-            let secrets = {
-                let mut cfg = ui.app.config.write().unwrap();
-                cfg.auth.password = value.clone();
-                cfg.config_dir.join("state").join("secrets.toml")
+    let cfg = ui.app.config.read().unwrap().clone();
+    let setting = match field {
+        EditField::Port => {
+            let mut service = cfg.service(id).clone();
+            service.port = match value.trim().parse::<u16>() {
+                Ok(p) if p > 0 => p,
+                _ => return Some(format!("invalid port: {value}")),
             };
-            if let Err(e) = crate::auth::store_password(&secrets, &value) {
-                return Some(format!("storing password failed: {e}"));
-            }
-            restart_auth_services(ui);
-            ui.status_msg = Some("password updated".into());
-            None
+            Setting::Service(id, service)
         }
+        EditField::Bind => {
+            let mut service = cfg.service(id).clone();
+            service.bind = value.trim().into();
+            Setting::Service(id, service)
+        }
+        EditField::Username => Setting::Credentials(value.trim().into(), cfg.auth.password),
+        EditField::Password => Setting::Credentials(cfg.auth.username, value),
         EditField::UploadDir => {
-            ui.app.config.write().unwrap().uploads.dir = value.trim().trim_matches('/').to_string();
-            save_config(ui);
-            ui.status_msg = Some("upload directory updated".into());
+            let mut upload = cfg.uploads;
+            upload.dir = value.trim().trim_matches('/').into();
+            Setting::Uploads(upload)
+        }
+        _ => return None,
+    };
+    match ui.app.engine().submit(Command::Set(setting)) {
+        Ok(_) => {
+            ui.status_msg = Some("settings updated".into());
             None
         }
-        _ => None,
+        Err(e) => Some(e),
     }
 }
 
 fn apply_input(ui: &mut Ui, action: InputAction, value: String) {
     match action {
-        InputAction::Port(id) => match value.trim().parse::<u16>() {
-            Ok(port) if port > 0 => {
-                if port < 1024 && !ui.app.privileged {
-                    ui.modal = Some(Modal::Message(format!(
-                        "Port {port} needs root privileges.\nRun with sudo, or use e.g. port {}.",
-                        id.default_port(false)
-                    )));
-                    return;
+        InputAction::Root => {
+            match ui
+                .app
+                .engine()
+                .submit(Command::ChangeRoot(PathBuf::from(value)))
+            {
+                Ok(_) => {
+                    ui.files.cwd.clear();
+                    let root = ui.app.config.read().unwrap().root.clone();
+                    ui.files.refresh(&root);
+                    ui.status_msg = Some("root changed; services stopped".into());
                 }
-                {
-                    let mut cfg = ui.app.config.write().unwrap();
-                    cfg.service_mut(id).port = port;
-                }
-                save_config(ui);
-                if ui.app.services.status(id).is_running() {
-                    ui.app.services.restart(id);
-                }
-                ui.status_msg = Some(format!("{} port set to {port}", id.display_name()));
+                Err(e) => ui.status_msg = Some(e),
             }
-            _ => ui.modal = Some(Modal::Message(format!("invalid port: {value}"))),
-        },
-        InputAction::Bind(id) => match value.trim().parse::<std::net::IpAddr>() {
-            Ok(_) => {
-                {
-                    let mut cfg = ui.app.config.write().unwrap();
-                    cfg.service_mut(id).bind = value.trim().to_string();
-                }
-                save_config(ui);
-                if ui.app.services.status(id).is_running() {
-                    ui.app.services.restart(id);
-                }
-                ui.status_msg = Some(format!(
-                    "{} bind set to {}",
-                    id.display_name(),
-                    value.trim()
-                ));
-            }
-            Err(_) => {
-                ui.modal = Some(Modal::Message(format!(
-                    "invalid bind address: {value}\nUse 0.0.0.0, 127.0.0.1 or a local interface IP \
-                     (see Dashboard for the list)."
-                )))
-            }
-        },
-        InputAction::Username => {
-            if value.trim().is_empty() {
-                ui.modal = Some(Modal::Message("username must not be empty".into()));
-                return;
-            }
-            ui.app.config.write().unwrap().auth.username = value.trim().to_string();
-            save_config(ui);
-            restart_auth_services(ui);
-            ui.status_msg = Some("username updated".into());
         }
-        InputAction::Password => {
-            if value.is_empty() {
-                ui.modal = Some(Modal::Message("password must not be empty".into()));
-                return;
-            }
-            let secrets = {
-                let mut cfg = ui.app.config.write().unwrap();
-                cfg.auth.password = value.clone();
-                cfg.config_dir.join("state").join("secrets.toml")
+        InputAction::Port(id) | InputAction::Bind(id) => {
+            let field = if matches!(action, InputAction::Port(_)) {
+                EditField::Port
+            } else {
+                EditField::Bind
             };
-            if let Err(e) = crate::auth::store_password(&secrets, &value) {
-                ui.status_msg = Some(format!("storing password failed: {e}"));
+            if let Some(err) = commit_service_edit(ui, id, field, value) {
+                ui.modal = Some(Modal::Message(err));
             }
-            restart_auth_services(ui);
-            ui.status_msg = Some("password updated".into());
+        }
+        InputAction::Username | InputAction::Password | InputAction::UploadDir => {
+            let field = match action {
+                InputAction::Username => EditField::Username,
+                InputAction::Password => EditField::Password,
+                _ => EditField::UploadDir,
+            };
+            if let Some(err) = commit_service_edit(ui, selected_service(ui), field, value) {
+                ui.modal = Some(Modal::Message(err));
+            }
         }
         InputAction::FileFilter => {
             ui.files.filter = value;
@@ -2470,11 +3022,6 @@ fn apply_input(ui: &mut Ui, action: InputAction, value: String) {
         }
         InputAction::LogFilter => {
             ui.log_filter = value;
-        }
-        InputAction::UploadDir => {
-            ui.app.config.write().unwrap().uploads.dir = value.trim().trim_matches('/').to_string();
-            save_config(ui);
-            ui.status_msg = Some("upload directory updated".into());
         }
         InputAction::HashCompare => {
             let result = ui.hashes.as_ref().map(|info| compare_hash(info, &value));
@@ -2484,18 +3031,6 @@ fn apply_input(ui: &mut Ui, action: InputAction, value: String) {
             ui.modal = Some(Modal::Hashes);
         }
     }
-}
-
-/// FTP and SSH cache credentials at start time; restart them so changes apply.
-fn restart_auth_services(ui: &mut Ui) {
-    for id in [ServiceId::Ftp, ServiceId::Ssh] {
-        if ui.app.services.status(id).is_running() {
-            ui.app.services.restart(id);
-        }
-    }
-    ui.app
-        .logger
-        .log(Event::new(LogLevel::Info, "core", "credentials updated"));
 }
 
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
@@ -2517,6 +3052,10 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn frontend_catalog_covers_shared_actions() {
+        assert_eq!(SUPPORTED_ACTIONS, transferbuddy_core::engine::ACTIONS);
+    }
     #[test]
     fn bulk_import_accepts_mixed_separators_deduplicates_and_validates() {
         assert_eq!(
@@ -2561,27 +3100,6 @@ mod tests {
                 .into(),
             compare: None,
         }
-    }
-
-    #[test]
-    fn ftp_password_is_redacted_for_the_log() {
-        assert_eq!(
-            redact_url_password("copy ftp://cisco:cisco123@10.0.0.1/img.bin flash:"),
-            "copy ftp://cisco:***@10.0.0.1/img.bin flash:"
-        );
-        for scheme in ["scp", "sftp"] {
-            assert_eq!(
-                redact_url_password(&format!(
-                    "copy {scheme}://cisco:secret@10.0.0.1/img.bin flash:"
-                )),
-                format!("copy {scheme}://cisco:***@10.0.0.1/img.bin flash:")
-            );
-        }
-        // URLs without credentials are unchanged.
-        let plain = "copy http://10.0.0.1:8080/img.bin flash:";
-        assert_eq!(redact_url_password(plain), plain);
-        let scp = "copy scp://cisco@10.0.0.1/img.bin flash:";
-        assert_eq!(redact_url_password(scp), scp);
     }
 
     #[test]

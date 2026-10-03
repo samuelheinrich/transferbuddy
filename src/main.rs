@@ -1,54 +1,26 @@
-mod auth;
-mod certs;
-mod cisco;
+pub use transferbuddy_core::{
+    auth, certs, cisco, config, deploy, fsroot, logging, netif, services, session, sound, sshkeys,
+    switch, upgrade, App, SharedApp,
+};
 mod cli;
-mod config;
-mod deploy;
-mod fsroot;
-mod logging;
-mod netif;
-mod services;
-mod session;
-mod sound;
-mod sshkeys;
-mod switch;
 mod tui;
 
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use clap::Parser;
 
 use crate::cli::Cli;
 use crate::config::Config;
-use crate::logging::{LogLevel, Logger};
-use crate::services::{ServiceId, ServiceManager};
-use crate::session::SessionManager;
-use crate::switch::SwitchManager;
+use crate::logging::LogLevel;
+use crate::services::ServiceId;
 
 /// One full version for the TUI, CLI and release builds.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Everything the services, the TUI and the headless runner share.
-pub struct App {
-    pub config: std::sync::RwLock<Config>,
-    pub logger: Arc<Logger>,
-    pub sessions: Arc<SessionManager>,
-    pub services: ServiceManager,
-    /// Open SSH sessions to network devices.
-    pub switches: SwitchManager,
-    pub privileged: bool,
-    /// Handle of the async runtime, so the (synchronous) TUI can spawn work
-    /// such as a deploy session.
-    pub runtime: tokio::runtime::Handle,
-}
-
-pub type SharedApp = Arc<App>;
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let privileged = unsafe { libc::geteuid() } == 0;
+    let privileged = transferbuddy_core::platform::is_privileged();
 
     let mut config = match Config::load(cli.config.as_deref()) {
         Ok(c) => c,
@@ -57,7 +29,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Err(e) = config.apply_cli(&cli, privileged) {
+    if let Err(e) = config.apply_cli(&transferbuddy_core::StartupOptions::from(&cli), privileged) {
         eprintln!("error: {e:#}");
         return ExitCode::from(2);
     }
@@ -66,12 +38,20 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let logger = Arc::new(Logger::new(
-        config.log_level,
-        config.log_file_path(),
-        cli.no_tui,
-    ));
-    if let Some(pin) = config.advertise.as_deref() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: failed to start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let app = App::new(config, runtime.handle().clone(), cli.no_tui);
+    let logger = app.logger.clone();
+    if let Some(pin) = app.config.read().unwrap().advertise.as_deref() {
         if netif::resolve_advertise(pin).is_none() {
             logger.log_simple(
                 LogLevel::Warning,
@@ -80,29 +60,6 @@ fn main() -> ExitCode {
             );
         }
     }
-    let sessions = Arc::new(SessionManager::new(config.session_history_secs));
-
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("error: failed to start async runtime: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let services = ServiceManager::new(runtime.handle().clone(), logger.clone(), sessions.clone());
-    let switches = SwitchManager::new(runtime.handle().clone(), logger.clone());
-    let app: SharedApp = Arc::new(App {
-        config: std::sync::RwLock::new(config),
-        logger: logger.clone(),
-        sessions: sessions.clone(),
-        services,
-        switches,
-        privileged,
-        runtime: runtime.handle().clone(),
-    });
-    app.services.attach_app(&app);
-    sessions.start_metrics_task(runtime.handle());
 
     logger.log_simple(
         LogLevel::Info,
@@ -139,8 +96,7 @@ fn main() -> ExitCode {
     };
 
     // Graceful shutdown of all listeners and device sessions.
-    app.services.stop_all();
-    app.switches.disconnect_all();
+    app.shutdown();
     runtime.shutdown_timeout(std::time::Duration::from_secs(3));
     ExitCode::from(code)
 }
@@ -169,7 +125,9 @@ fn run_headless(runtime: &tokio::runtime::Runtime, app: &SharedApp) -> u8 {
         eprintln!("error: no service enabled (use --http, --tftp, ... or --all)");
         return 2;
     }
-    let any_running = ServiceId::ALL.iter().any(|id| app.services.status(*id).is_running());
+    let any_running = ServiceId::ALL
+        .iter()
+        .any(|id| app.services.status(*id).is_running());
     if !any_running {
         eprintln!("error: no service could be started");
         return 1;
@@ -210,7 +168,12 @@ fn print_status(app: &SharedApp) {
         }
     );
     for ifa in netif::candidates() {
-        println!("    {:<8} {:<16} {}", ifa.name, ifa.ip.to_string(), ifa.kind.label());
+        println!(
+            "    {:<8} {:<16} {}",
+            ifa.name,
+            ifa.ip.to_string(),
+            ifa.kind.label()
+        );
     }
     for id in ServiceId::ALL {
         let sc = cfg.service(id);

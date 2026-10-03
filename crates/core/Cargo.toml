@@ -1,0 +1,39 @@
+[package]
+name = "transferbuddy-core"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+
+[features]
+test-support = []
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# TLS / certificates
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+rcgen = "0.13"
+# SSH (SFTP + SCP)
+russh = "0.46"
+russh-keys = "0.46"
+russh-sftp = "2"
+# Config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Utilities
+dirs = "5"
+if-addrs = "0.13"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+sha2 = "0.10"
+md-5 = "0.10"
+anyhow = "1"
+async-trait = "0.1"
+libc = "0.2"
+
+vt100 = "0.15"
+
+[dev-dependencies]
+tempfile = "3"

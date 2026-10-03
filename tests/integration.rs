@@ -11,7 +11,11 @@ fn bin() -> &'static str {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 struct Server {
@@ -31,7 +35,11 @@ impl Server {
         std::fs::create_dir_all(root.join("up")).unwrap();
 
         let http_port = free_port();
-        let tftp_port = free_port();
+        let tftp_port = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let mut cmd = Command::new(bin());
         cmd.args([
             "--no-tui",
@@ -58,25 +66,45 @@ impl Server {
             cmd.arg("--uploads");
         }
         let child = cmd.spawn().expect("spawning transferbuddy");
-        let server = Server { child, _dir: dir, http_port, tftp_port };
+        let server = Server {
+            child,
+            _dir: dir,
+            http_port,
+            tftp_port,
+        };
         server.wait_ready();
         server
     }
 
     fn wait_ready(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
         while Instant::now() < deadline {
             if TcpStream::connect(("127.0.0.1", self.http_port)).is_ok() {
-                return;
+                let _ = probe.send_to(
+                    b"\x00\x01.tb-readiness-probe\x00octet\x00",
+                    ("127.0.0.1", self.tftp_port),
+                );
+                let mut response = [0u8; 512];
+                if let Ok((n, _)) = probe.recv_from(&mut response) {
+                    if n >= 4 && response[..2] == [0, 5] {
+                        return;
+                    }
+                }
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("server did not become ready");
+        panic!("HTTP and TFTP services did not become ready");
     }
 
     fn http(&self, request: &str) -> (u16, Vec<u8>) {
         let mut stream = TcpStream::connect(("127.0.0.1", self.http_port)).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = Vec::new();
         // Read the declared HTTP response, rather than waiting for socket EOF.
@@ -89,9 +117,12 @@ impl Server {
             assert!(response.len() < 16 * 1024, "HTTP headers too large");
         }
         let body_start = response.len();
-        let content_length = String::from_utf8_lossy(&response).lines()
+        let content_length = String::from_utf8_lossy(&response)
+            .lines()
             .find_map(|line| line.strip_prefix("Content-Length: "))
-            .unwrap().parse::<usize>().unwrap();
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
         response.resize(body_start + content_length, 0);
         stream.read_exact(&mut response[body_start..]).unwrap();
         let head = String::from_utf8_lossy(&response);
@@ -109,7 +140,9 @@ impl Server {
     }
 
     fn get(&self, path: &str) -> (u16, Vec<u8>) {
-        self.http(&format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+        self.http(&format!(
+            "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        ))
     }
 }
 
@@ -144,7 +177,12 @@ fn http_download_and_errors() {
 #[test]
 fn http_blocks_path_traversal() {
     let s = Server::start(false);
-    for evil in ["/../etc/passwd", "/../../etc/passwd", "/sub/../../etc/passwd", "/%2e%2e/etc/passwd"] {
+    for evil in [
+        "/../etc/passwd",
+        "/../../etc/passwd",
+        "/sub/../../etc/passwd",
+        "/%2e%2e/etc/passwd",
+    ] {
         let (code, _) = s.get(evil);
         assert!(code == 403 || code == 404, "{evil} returned {code}");
     }
@@ -205,7 +243,9 @@ fn parallel_http_downloads() {
 fn tftp_download_rrq() {
     let s = Server::start(false);
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     // RRQ image.bin octet
     let mut rrq = vec![0, 1];
     rrq.extend_from_slice(b"sub/nested.cfg\0octet\0");
@@ -234,14 +274,20 @@ fn tftp_download_rrq() {
 fn tftp_blocks_traversal() {
     let s = Server::start(false);
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let mut rrq = vec![0, 1];
     rrq.extend_from_slice(b"../../etc/passwd\0octet\0");
     socket.send_to(&rrq, ("127.0.0.1", s.tftp_port)).unwrap();
     let mut buf = [0u8; 1024];
     let (n, _) = socket.recv_from(&mut buf).unwrap();
     assert!(n >= 4);
-    assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), 5, "expected ERROR packet");
+    assert_eq!(
+        u16::from_be_bytes([buf[0], buf[1]]),
+        5,
+        "expected ERROR packet"
+    );
 }
 
 #[test]
@@ -270,7 +316,7 @@ fn occupied_port_fails_with_clean_exit() {
 }
 
 #[test]
-fn privileged_port_rejected_without_root() {
+fn low_port_errors_come_from_the_actual_listener() {
     let dir = tempfile::tempdir().unwrap();
     let out = Command::new(bin())
         .args([
@@ -278,6 +324,8 @@ fn privileged_port_rejected_without_root() {
             "--http",
             "--port-http",
             "80",
+            "--bind",
+            "192.0.2.123",
             "--root",
             dir.path().to_str().unwrap(),
             "--config",
@@ -285,9 +333,9 @@ fn privileged_port_rejected_without_root() {
         ])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("sudo"), "stderr was: {err}");
+    assert!(!err.contains("invalid configuration"), "stderr was: {err}");
 }
 
 #[test]

@@ -100,3 +100,37 @@ pub struct Cli {
     #[arg(long, value_name = "N")]
     pub max_sessions: Option<usize>,
 }
+
+impl From<&Cli> for transferbuddy_core::StartupOptions {
+    fn from(cli: &Cli) -> Self {
+        Self {
+            root: cli.root.clone(),
+            interface: cli.interface.clone(),
+            http: cli.http,
+            https: cli.https,
+            ftp: cli.ftp,
+            sftp: cli.sftp,
+            scp: cli.scp,
+            tftp: cli.tftp,
+            all: cli.all,
+            port_http: cli.port_http,
+            port_https: cli.port_https,
+            port_ftp: cli.port_ftp,
+            port_sftp: cli.port_sftp,
+            port_tftp: cli.port_tftp,
+            bind: cli.bind.clone(),
+            username: cli.username.clone(),
+            password: cli.password.clone(),
+            uploads: cli.uploads,
+            upload_dir: cli.upload_dir.clone(),
+            max_upload_mib: cli.max_upload_mib,
+            no_tui: cli.no_tui,
+            no_intro: cli.no_intro,
+            no_sound: cli.no_sound,
+            log_level: cli.log_level.clone(),
+            log_file: cli.log_file.clone(),
+            config: cli.config.clone(),
+            max_sessions: cli.max_sessions,
+        }
+    }
+}

@@ -1,0 +1,32 @@
+{
+  "productName": "TransferBuddy",
+  "identifier": "com.transferbuddy.desktop",
+  "category": "Utility",
+  "icons": ["packaging/icons/transferbuddy.png", "packaging/icons/transferbuddy@2x.png"],
+  "description": "SSH sessions, file transfers and Cisco INSTALL upgrades",
+  "binaries": [
+    {
+      "path": "transferbuddy-desktop",
+      "main": true
+    },
+    {
+      "path": "transferbuddy",
+      "main": false
+    },
+    {
+      "path": "transferbuddy-port-helper",
+      "main": false
+    }
+  ],
+  "macos": {
+    "minimumSystemVersion": "13.0",
+    "infoPlistPath": "packaging/macos/Info.plist"
+  },
+  "resources": [
+    {
+      "src": "packaging/macos/com.transferbuddy.port-helper.plist",
+      "target": "../Library/LaunchDaemons/com.transferbuddy.port-helper.plist"
+    }
+  ],
+  "name": "transferbuddy-desktop"
+}

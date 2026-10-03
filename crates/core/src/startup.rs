@@ -1,0 +1,32 @@
+use std::path::PathBuf;
+/// Frontend-independent startup settings. CLI parsing remains in the terminal app.
+#[derive(Debug, Clone, Default)]
+pub struct StartupOptions {
+    pub root: Option<PathBuf>,
+    pub interface: Option<String>,
+    pub http: bool,
+    pub https: bool,
+    pub ftp: bool,
+    pub sftp: bool,
+    pub scp: bool,
+    pub tftp: bool,
+    pub all: bool,
+    pub port_http: Option<u16>,
+    pub port_https: Option<u16>,
+    pub port_ftp: Option<u16>,
+    pub port_sftp: Option<u16>,
+    pub port_tftp: Option<u16>,
+    pub bind: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub uploads: bool,
+    pub upload_dir: Option<String>,
+    pub max_upload_mib: Option<u64>,
+    pub no_tui: bool,
+    pub no_intro: bool,
+    pub no_sound: bool,
+    pub log_level: Option<String>,
+    pub log_file: Option<PathBuf>,
+    pub config: Option<PathBuf>,
+    pub max_sessions: Option<usize>,
+}

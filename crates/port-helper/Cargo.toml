@@ -1,0 +1,9 @@
+[package]
+name = "transferbuddy-port-helper"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+transferbuddy-core = { path = "../core" }
+libc = "0.2"
