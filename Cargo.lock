@@ -5692,7 +5692,7 @@ dependencies = [
 
 [[package]]
 name = "transferbuddy"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5707,7 +5707,7 @@ dependencies = [
 
 [[package]]
 name = "transferbuddy-core"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5734,7 +5734,7 @@ dependencies = [
 
 [[package]]
 name = "transferbuddy-desktop"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
@@ -5761,7 +5761,7 @@ dependencies = [
 
 [[package]]
 name = "transferbuddy-port-helper"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "libc",
  "transferbuddy-core",

@@ -33,4 +33,4 @@ default-members = ["."]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.14"
+version = "0.2.15"

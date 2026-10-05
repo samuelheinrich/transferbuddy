@@ -17,6 +17,11 @@ commands. Each running process owns its connections and jobs.
 [Release notes and checksums](https://github.com/samuelheinrich/transferbuddy/releases/tag/v0.2.14)
 · [Desktop architecture](docs/desktop.md)
 · [Screenshot gallery](docs/screenshots/README.md)
+· [Roadmap](ROADMAP.md)
+
+Windows desktop support is a deferred proposal, open for contributions with no
+target release. See the [roadmap](ROADMAP.md) for scope, prerequisites, tests,
+limitations and effort estimates.
 
 ![TransferBuddy desktop Dashboard](docs/screenshots/desktop/dashboard.png)
 
